@@ -1,69 +1,83 @@
-# Windows 11 Upgrade Script with Prechecks and Remediations
- 
-This PowerShell script is designed to be deployed as a Win32 app through Microsoft Intune. It upgrades eligible Windows 10 devices to Windows 11 while automatically addressing common upgrade blockers.
- 
-## Features
- 
-- Detects if the device meets Windows 11 upgrade requirements:
-  - TPM 2.0
-  - UEFI Boot
-  - Secure Boot
-- Deletes unnecessary font files from the System Reserved partition to resolve known upgrade issues.
-- Cleans up unsigned Microsoft printer drivers.
-- Detects and remediates known upgrade compatibility blocks ("Red Reasons").
-- Automatically downloads and launches the Windows 11 Installation Assistant.
-- Uses ServiceUI.exe to present upgrade prompts in the logged-on user's session (if a user is logged on).
-- Waits for the upgrade assistant to complete with monitored timeout logic.
-- Provides detailed logging to both console output and files.
- 
-## Deployment Requirements
- 
-- Windows 10 (preferably version 22H2).
-- Devices must be managed through Intune.
-- The script must be deployed as a **Win32 app** from Intune.
-- The script must be executed in the **SYSTEM** context.
- 
-## How the Script Works
- 
-1. **Pre-Checks:**
-   - Validates that TPM 2.0, UEFI boot, and Secure Boot are present and active.
-   - Collects system and OS information for logging.
- 
-2. **Remediations:**
-   - Deletes font files in the System Reserved partition to free space.
-   - Removes unsigned Microsoft virtual printer drivers.
-   - Clears upgrade compatibility blocks and reruns the appraiser process.
- 
-3. **Upgrade Execution:**
-   - Downloads Windows11InstallationAssistant.exe if it is not already present.
-   - Optionally downloads ServiceUI.exe to display upgrade prompts to logged-on users.
-   - Detects and terminates any existing stuck upgrade assistant processes.
-   - Launches the upgrade assistant and monitors its execution for up to two hours.
- 
-4. **Logging:**
-   - Creates detailed logs in `C:\Windows\Logs\`.
-   - Saves both a formatted event log and a full PowerShell transcript.
- 
-## Files Created
- 
-| Path | Purpose |
-|:-----|:--------|
-| `C:\Windows\Logs\Win11_Upgrade-*.log` | Main process log (event-style formatting) |
-| `C:\Windows\Logs\Win11_Upgrade_Transcript-*.log` | Full PowerShell transcript |
-| `C:\Temp\Win11` | Working directory for downloaded upgrade tools |
- 
+
+# Upgrade_Windows_with_Fixes.ps1
+
+## Overview
+
+This script prepares Windows 10 devices for upgrade to Windows 11 by validating and remediating WinRE and system reserved partitions, resolving upgrade blockers, and dynamically monitoring the upgrade process.\
+It is intended to be deployed **as a Win32 app through Microsoft Intune**.
+
+The script addresses common upgrade failures, including partition sizing issues, compatibility "red reasons," and blocking printer drivers, based on Microsoft's official guidance.
+
+---
+
+## Key Features
+
+- Verifies and updates WinRE partition configuration for GPT and MBR disks.
+- Resizes the recovery partition if insufficient free space exists.
+- Updates the WinRE image to meet minimum version requirements:
+  - Windows 11 version 21H2: WinRE must be ≥ 10.0.22000.2710
+  - Windows 10 versions 21H2/22H2: WinRE must be ≥ 10.0.19041.3920
+- Deletes unnecessary fonts and language folders, retaining only **en-US** by default (modify if required).
+- Detects and removes unsigned Microsoft printer drivers that may block Windows 11 upgrades.
+- Clears "red reasons" from the registry and re-runs the compatibility appraiser.
+- Runs Disk Cleanup if free space is low.
+- Launches the Windows 11 Installation Assistant using **ServiceUI.exe** (if logged-on users are detected).
+- Dynamically monitors the upgrade process:
+  - Switches from monitoring `Windows11InstallationAssistant.exe` to `windows10upgraderapp.exe`.
+  - Implements CPU idle timeout detection to handle user reboot prompts.
+- Extensive logging to both console and log files.
+
+---
+
+## Prerequisites
+
+- **ServiceUI.exe** must be hosted by you in your own Azure Blob Storage account.
+  - This script does not supply ServiceUI.exe.
+  - You must update the `$serviceUIUrl` variable with your hosted download URL.
+- Win32 app packaging and deployment via Microsoft Intune.
+
+---
+
+## Usage
+
+Example command to run the script manually:
+
+```powershell
+powershell.exe -noprofile -executionpolicy bypass -file .\Upgrade_Windows_with_Fixes.ps1
+```
+
+In Intune (Win32 app), specify the install command:
+
+```powershell
+powershell.exe -noprofile -executionpolicy bypass -file Upgrade_Windows_with_Fixes.ps1
+```
+
+---
+
 ## Important Notes
- 
-- The script uses `taskkill.exe` to forcibly terminate any previously running instances of Windows11InstallationAssistant.exe if detected.
-- If ServiceUI.exe is not available or no user is logged on, the upgrade runs silently without presenting a window.
-- Timeout is set to 2 hours by default but can be adjusted in the script.
-- All variables such as download URLs and arguments are located near the top of the script for easy modification.
-- Windows Update readiness or driver compatibility checks outside of the scope of this script are not performed.
- 
-## License
- 
-This script is provided under the MIT License. Refer to the LICENSE file for details.
- 
-## Disclaimer
- 
-This script is provided as-is without warranty of any kind. It is recommended to test thoroughly in a controlled environment before production deployment.
+
+- By default, **only the "en-US"** language folder is preserved when cleaning up the EFI boot partition.\
+  If you use a different system locale, modify the script to preserve the appropriate language folder(s).
+- Portions of this script — specifically the recovery partition resizing logic — are adapted from Microsoft’s published KB:
+  - [KB5035679: Instructions to resize the recovery partition](https://support.microsoft.com/en-us/topic/kb5035679-instructions-to-run-a-script-to-resize-the-recovery-partition-to-install-a-winre-update-98502836-cb2c-4d9a-874c-23bcdf16cd45)
+- This script is provided **"as is"** without any warranty. Test thoroughly before production use.
+
+---
+
+## Version History
+
+| Version | Date           | Changes                                                                                             |
+| ------- | -------------- | --------------------------------------------------------------------------------------------------- |
+| 8.0     | July 19, 2024  | Added check for "red reasons" and Windows 11 upgrade.                                               |
+| 9.0     | April 16, 2025 | Added removal of blocking Microsoft printer drivers, disk cleanup, and TPM/UEFI/Secure Boot checks. |
+| 10.0    | April 25, 2025 | Improved logging; adjusted free space logic; increased upgrade wait time.                           |
+| 11.0    | April 25, 2025 | Fixed bcdedit detection bug.                                                                        |
+| 12.0    | April 28, 2025 | Extended font deletion; added ServiceUI support and download logic.                                 |
+| 13.0    | April 29, 2025 | Improved abandoned process detection; added child process monitoring and CPU idle timeout logic.    |
+
+---
+
+## Author
+
+**John Marcum (PJM)**\
+[Twitter/X: @MEM_MVP](https://x.com/MEM_MVP)
