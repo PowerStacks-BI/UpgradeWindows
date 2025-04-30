@@ -73,7 +73,9 @@ powershell.exe -noprofile -executionpolicy bypass -file Upgrade_Windows_with_Fix
 | 10.0    | April 25, 2025 | Improved logging; adjusted free space logic; increased upgrade wait time.                           |
 | 11.0    | April 25, 2025 | Fixed bcdedit detection bug.                                                                        |
 | 12.0    | April 28, 2025 | Extended font deletion; added ServiceUI support and download logic.                                 |
-| 13.0    | April 29, 2025 | Improved abandoned process detection; added child process monitoring and CPU idle timeout logic.    |
+| 13.0    | April 29, 2025 | Improved abandoned process detection; added child process monitoring and CPU idle timeout logic. 
+| 16.0    | April 29, 2025 | Removed Get-ChildProcess function due to unreliable results across systems
+| 17.0    | April 29, 2025 | Total re-write of the resize-disk function
 
 ---
 
