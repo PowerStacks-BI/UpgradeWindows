@@ -76,7 +76,10 @@ powershell.exe -noprofile -executionpolicy bypass -file Upgrade_Windows_with_Fix
 | 13.0    | April 29, 2025 | Improved abandoned process detection; added child process monitoring and CPU idle timeout logic. 
 | 16.0    | April 29, 2025 | Removed Get-ChildProcess function due to unreliable results across systems
 | 17.0    | April 29, 2025 | Total re-write of the resize-disk function
-| 18.0    | April 30, 2025 | Added another process to monitor in attempt to accurately determine when the upgrade has completed. 
+| 18.0    | April 30, 2025 | Added another process to monitor in attempt to accurately determine when the upgrade has completed.
+| 19.0    | April 30, 2025 | Added relaunching process using 64 bit powershell.
+| 20.0    | April 30, 2025 | Added support for putting ServiceUI.exe in the Win32 app package.   
+
 
 ---
 

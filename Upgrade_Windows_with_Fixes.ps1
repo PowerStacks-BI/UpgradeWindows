@@ -92,6 +92,13 @@ Contact: https://x.com/MEM_MVP
 - Created function to monitor processes
 - Added new process to monitor $WINDOWS.~BT\Sources\SetupHost
 
+19 - April 30,2025
+- Relaunch Script in 64-bit PowerShell (if currently running in 32-bit on x64 system)
+- Skip the entire boot mode detection if we cannot find bcdedit.exe
+
+20 - April 30, 2025
+- Added support for placing serviceui.exe into the Win32 package
+
 
 .EXAMPLE
 To execute the script manually:
@@ -105,18 +112,57 @@ In Intune (Win32 app), specify this as the install command:
 #>
 
 
+# ---------------------------------------------------------------------------------------------------
+# Relaunch Script in 64-bit PowerShell (if currently running in 32-bit on x64 system)
+# ---------------------------------------------------------------------------------------------------
+# PowerShell running in a 32-bit process cannot access certain 64-bit-only system tools (e.g., bcdedit.exe).
+# This block ensures the script is relaunched under 64-bit PowerShell by invoking the SysNative alias,
+# which allows 32-bit processes to run 64-bit binaries.
+#
+# Notes:
+# - This check is skipped on ARM64 systems.
+# - If transcription is active, it is stopped to avoid errors during relaunch.
+# - $PSCommandPath ensures the same script file is relaunched.
+#
+# Intune Compatibility:
+# This approach ensures compatibility with Intune detection/remediation scripts that may run in 32-bit context.
+# ---------------------------------------------------------------------------------------------------
+
+if ("$env:PROCESSOR_ARCHITEW6432" -ne "ARM64") {
+    Write-Host "Not on ARM64"
+
+    $x64Shell = "$env:WINDIR\SysNative\WindowsPowerShell\v1.0\powershell.exe"
+    if (Test-Path $x64Shell) {
+        try {
+            Stop-Transcript
+            Write-Host "Stopping transcription before relaunching as a 64-bit process"
+        }
+        catch {}
+
+        & $x64Shell -ExecutionPolicy Bypass -NoProfile -File "$PSCommandPath"
+
+        Write-Host "Relaunched as a 64-bit process"
+        Exit $lastexitcode
+    }
+}
+# END: Relaunch in 64-bit PowerShell
+
 # ------------------------------------
 # Begin Defining Script Variables
 # ------------------------------------
+
 # ========================================
 # Variables: Logging
 # ========================================
+[int]$Version = 20
 $Now = Get-Date -Format MM-dd-yyyy-HH-mm-ss
 $LogFile = "C:\Windows\Logs\Win11_Upgrade-$Now.log"
 $DriverLog = "C:\Windows\Logs\UnsignedPrinterDrivers.csv"
 $TranscriptFile = "C:\Windows\Logs\Win11_Upgrade_Transcript-$Now.log"
 
 Start-Transcript -Path $TranscriptFile
+
+Write-Host "Starting upgrade using script version: $($Version)"
 
 # ========================================
 # Variables: Script Configuration
@@ -129,8 +175,14 @@ $upgradeArgs = "/quietinstall /skipeula /auto upgrade /copylogs $Win11WorkingDir
 # Variables: ServiceUI
 # ========================================
 # IMPORTANT: Set this to your own Azure Blob Storage URL containing ServiceUI.exe
+# OR
+# Place ServiceUI.exe in the root of your Win32 package and set this to: "$PSScriptRoot\ServiceUI.exe"
 # (This script does NOT host or provide ServiceUI.exe.)
-$ServiceUIUrl = ''
+
+$ServiceUIPath = "$PSScriptRoot\ServiceUI.exe"
+#$ServiceUIPath = "'https://<YOUR URL>/serviceui/ServiceUI.exe'"
+$ServiceUIDestination = "$Win11WorkingDirectory\ServiceUI.exe"
+
 
 # ========================================
 # Variables: Registry Paths (for clearing upgrade blocks)
@@ -1118,30 +1170,35 @@ Else {
     }
 
     # --- UEFI Boot Mode Check ---
-    try {
-        LogMessage -message ("Checking for UEFI Boot") -Component 'Boot Mode Check'
-        $bcdOutput = & "$env:windir\System32\bcdedit.exe" 2>$null
-        $bootMode = $bcdOutput | Select-String "path.*efi"
-        if (-not $bootMode) {
-            LogMessage -message ("System is booted in Legacy BIOS mode (not UEFI)") -Type 2 -Component 'Boot Mode Check'
-            $failures += "System is booted in Legacy BIOS mode (not UEFI)"
+    if (Test-Path "$env:windir\System32\bcdedit.exe") {
+        try {
+            LogMessage -message ("Checking for UEFI Boot") -Component 'Boot Mode Check'
+            $bcdOutput = & "$env:windir\System32\bcdedit.exe" 2>$null
+            $bootMode = $bcdOutput | Select-String "path.*efi"
+            if (-not $bootMode) {
+                LogMessage -message ("System is booted in Legacy BIOS mode (not UEFI)") -Type 2 -Component 'Boot Mode Check'
+                $failures += "System is booted in Legacy BIOS mode (not UEFI)"
+            }
+            else {
+                LogMessage -message ("System is booted in UEFI mode") -Component 'Boot Mode Check'
+            }
         }
-        else {
-            LogMessage -message ("System is booted in UEFI mode") -Component 'Boot Mode Check'
+        catch {
+            $errorMessage = $_.Exception.Message
+            if ($errorMessage -like "*The term 'bcdedit'*") {
+                LogMessage -message ("WARNING: bcdedit.exe not found. Skipping boot mode check.") -Type 2 -Component 'Boot Mode Check'
+                # Do not add this to $failures, just warn and continue
+            }
+            else {
+                LogMessage -message ("Boot mode detection failed. Error: $errorMessage") -Type 3 -Component 'Boot Mode Check'
+                $failures += "Boot mode detection failed: $errorMessage"
+            }
         }
     }
-    catch {
-        $errorMessage = $_.Exception.Message
-        if ($errorMessage -like "*The term 'bcdedit'*") {
-            LogMessage -message ("WARNING: bcdedit.exe not found. Skipping boot mode check.") -Type 2 -Component 'Boot Mode Check'
-            # Do not add this to $failures, just warn and continue
-        }
-        else {
-            LogMessage -message ("Boot mode detection failed. Error: $errorMessage") -Type 3 -Component 'Boot Mode Check'
-            $failures += "Boot mode detection failed: $errorMessage"
-        }
+    else {
+        LogMessage -message ("WARNING: bcdedit.exe not found. Skipping boot mode check.") -Type 2 -Component 'Boot Mode Check'
     }
-
+    
     # --- Secure Boot Check ---
     try {
         if (Confirm-SecureBootUEFI) {
@@ -1519,43 +1576,58 @@ Else {
             mkdir $Win11WorkingDirectory
         }
  
-        # Create a WebClient object for downloading files
+        # ========================================
+        # Initialize WebClient
+        # ========================================
+        # Creates a reusable WebClient object for downloading files from remote URLs.
+        # This should only be created once and reused as needed throughout the script.
+        # NOTE: Proxy settings, headers, or timeout settings can be configured here if required.
+
         $webClient = New-Object System.Net.WebClient
-        
-        # If we have a path to get serviceui.exe let's try to use it...
-        if ($serviceUIUrl) {
-            
-            # Set the URL to download the serviceui.exe file to
-            $serviceUIPath = "$($Win11WorkingDirectory)\ServiceUI.exe"
-            
-            # Detect logged-on users
-            $loggedOnUsers = Get-LoggedOnUser
 
-            # Download ServiceUI.exe only if someone is logged in
-            if ($loggedOnUsers.Count -gt 0) {
-                LogMessage -message ("Detected logged-on users: $($loggedOnUsers -join ', ')") -Component 'Script'
+        # END: Initialize WebClient
 
-                if (-not (Test-Path $serviceUIPath)) {
-                    try {
-                        LogMessage -message ("Downloading ServiceUI.exe to $serviceUIPath...") -Component 'Script'
-                        $webClient.DownloadFile($serviceUIUrl, $serviceUIPath)
-                        LogMessage -message ("Successfully downloaded ServiceUI.exe.") -Component 'Script'
-                    }
-                    catch {
-                        LogMessage -message ("Failed to download ServiceUI.exe. Error: $_") -Type 3 -Component 'Script'                       
-                    }
+        # ========================================
+        # ServiceUI.exe Handling
+        # ========================================
+        # Supports both:
+        # - Local file (bundled in package)
+        # - HTTPS URL (downloaded)
+
+        $loggedOnUsers = Get-LoggedOnUser
+
+        if ($loggedOnUsers.Count -gt 0) {
+            LogMessage -message ("Detected logged-on users: $($loggedOnUsers -join ', ')") -Component 'Script'
+
+            if ($ServiceUIPath -like 'https://*') {
+                try {
+                    LogMessage -message ("Downloading ServiceUI.exe from $ServiceUIPath...") -Component 'Script'
+                    $webClient.DownloadFile($ServiceUIPath, $ServiceUIDestination)
+                    LogMessage -message ("Successfully downloaded ServiceUI.exe.") -Component 'Script'
                 }
-                else {
-                    LogMessage -message ("Found previously downloaded ServiceUI.exe.") -Component 'Script'
+                catch {
+                    LogMessage -message ("Failed to download ServiceUI.exe. Error: $_") -Type 3 -Component 'Script'
+                }
+            }
+            elseif (Test-Path $ServiceUIPath) {
+                try {
+                    LogMessage -message ("Copying ServiceUI.exe from local package to working directory...") -Component 'Script'
+                    Copy-Item -Path $ServiceUIPath -Destination $ServiceUIDestination -Force
+                    LogMessage -message ("Successfully copied ServiceUI.exe.") -Component 'Script'
+                }
+                catch {
+                    LogMessage -message ("Failed to copy local ServiceUI.exe. Error: $_") -Type 3 -Component 'Script'
                 }
             }
             else {
-                LogMessage -message ("No logged-on users detected. Skipping ServiceUI.exe download.") -Component 'Script'
+                LogMessage -message ("ServiceUI.exe not found at specified path: $ServiceUIPath") -Type 2 -Component 'Script'
             }
         }
         else {
-            LogMessage -message ("No path specified from which to download serviceui.exe. Skipping using it!") -Type 2 -Component 'Script'
+            LogMessage -message ("No logged-on users detected. Skipping ServiceUI.exe handling.") -Component 'Script'
         }
+        # END: ServiceUI.exe Handling
+
         
         # Set the URL to download the Windows 11 Installation Assistant file from
         $Windows11InstallationAssistantUrl = 'https://go.microsoft.com/fwlink/?linkid=2171764'   
