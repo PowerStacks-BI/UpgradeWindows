@@ -135,7 +135,7 @@ param (
     # OR
     # Place ServiceUI.exe in the root of your Win32 package and set this to: "$PSScriptRoot\ServiceUI.exe"
     # (This script does NOT host or provide ServiceUI.exe.)
-    [string]$ServiceUIPath = "https://st398314intune01.blob.core.windows.net/serviceui/ServiceUI.exe",
+    [string]$ServiceUIPath = "$PSScriptRoot\ServiceUI.exe",
     [int]$MinRequiredFreeSpaceGB = 30
 )
 # ---------------------------------------------------------------------------------------------------
