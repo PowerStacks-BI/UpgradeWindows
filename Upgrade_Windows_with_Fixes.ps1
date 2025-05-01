@@ -99,6 +99,17 @@ Contact: https://x.com/MEM_MVP
 20 - April 30, 2025
 - Added support for placing serviceui.exe into the Win32 package
 
+21 - May 1, 2025
+- Removed the attempt(s) to detect sucess/failure of the upgrade. Doing so is just not reliable. Instead let the detection script figure it out after later!
+- Added a 30 minute wait for the upgrade before exiting the script just to attempt to postpone the detection script for a while but not to exceed the reboot countdown. (45-60 is prob safe too)
+- Fixed a bug in the red reason (compatibility) checker.
+- Created new SleepNow function to sleep and log sleep time remaining periodically.
+- Migrated some script variables to parameters:
+    - $Win11WorkingDirectory
+    - $ServiceUIPath (default is including serviceui.exe in the Win32 App)
+    - $MinRequiredFreeSpaceGB
+- Added creation of scheduled task to reclaim disk space at first login (If Win11)
+
 
 .EXAMPLE
 To execute the script manually:
@@ -109,96 +120,91 @@ In Intune (Win32 app), specify this as the install command:
 
     powershell.exe -noprofile -executionpolicy bypass -file Upgrade_Windows_with_Fixes.ps1
 
+In Intune (Win32 app), specify this as the install command (if using a blob URL):
+
+    powershell.exe -noprofile -executionpolicy bypass -file Upgrade_Windows_with_Fixes.ps1 -ServiceUIPath "https://yourstorage.blob.core.windows.net/tools/ServiceUI.exe"
+
 #>
+
+# ---------------------------------------------------------------------------------------------------
+#  Begin Parameter Definitions (user-overridable)
+# ---------------------------------------------------------------------------------------------------
+param (
+    [string]$Win11WorkingDirectory = "C:\Temp\Win11",
+    # IMPORTANT: Set $ServiceUIPath to your own Azure Blob Storage URL containing ServiceUI.exe
+    # OR
+    # Place ServiceUI.exe in the root of your Win32 package and set this to: "$PSScriptRoot\ServiceUI.exe"
+    # (This script does NOT host or provide ServiceUI.exe.)
+    [string]$ServiceUIPath = "https://st398314intune01.blob.core.windows.net/serviceui/ServiceUI.exe",
+    [int]$MinRequiredFreeSpaceGB = 30
+)
+# ---------------------------------------------------------------------------------------------------
+#  End Parameter Definitions (user-overridable)
+# ---------------------------------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------------------------------
 # Relaunch Script in 64-bit PowerShell (if currently running in 32-bit on x64 system)
 # ---------------------------------------------------------------------------------------------------
-# PowerShell running in a 32-bit process cannot access certain 64-bit-only system tools (e.g., bcdedit.exe).
-# This block ensures the script is relaunched under 64-bit PowerShell by invoking the SysNative alias,
-# which allows 32-bit processes to run 64-bit binaries.
-#
-# Notes:
-# - This check is skipped on ARM64 systems.
-# - If transcription is active, it is stopped to avoid errors during relaunch.
-# - $PSCommandPath ensures the same script file is relaunched.
-#
-# Intune Compatibility:
-# This approach ensures compatibility with Intune detection/remediation scripts that may run in 32-bit context.
-# ---------------------------------------------------------------------------------------------------
-
 if ("$env:PROCESSOR_ARCHITEW6432" -ne "ARM64") {
     Write-Host "Not on ARM64"
+    if (Test-Path "$($env:WINDIR)\SysNative\WindowsPowerShell\v1.0\powershell.exe") {    
 
-    $x64Shell = "$env:WINDIR\SysNative\WindowsPowerShell\v1.0\powershell.exe"
-    if (Test-Path $x64Shell) {
-        try {
-            Stop-Transcript
-            Write-Host "Stopping transcription before relaunching as a 64-bit process"
-        }
-        catch {}
-
-        & $x64Shell -ExecutionPolicy Bypass -NoProfile -File "$PSCommandPath"
-
+        
+        # Relaunch as 64-bit
+        & "$($env:WINDIR)\SysNative\WindowsPowerShell\v1.0\powershell.exe" -ExecutionPolicy bypass -NoProfile -File "$PSCommandPath"
+        
         Write-Host "Relaunched as a 64-bit process"
         Exit $lastexitcode
     }
 }
-# END: Relaunch in 64-bit PowerShell
+
 
 # ------------------------------------
 # Begin Defining Script Variables
 # ------------------------------------
 
+# ------------------------------------
+# Script Version Info
+# ------------------------------------
+[int]$ScriptVersion = 21.2
+
+
 # ========================================
 # Variables: Logging
 # ========================================
-[int]$Version = 20
 $Now = Get-Date -Format MM-dd-yyyy-HH-mm-ss
 $LogFile = "C:\Windows\Logs\Win11_Upgrade-$Now.log"
 $DriverLog = "C:\Windows\Logs\UnsignedPrinterDrivers.csv"
 $TranscriptFile = "C:\Windows\Logs\Win11_Upgrade_Transcript-$Now.log"
-
 Start-Transcript -Path $TranscriptFile
+Write-Host "Starting upgrade using script version: $($ScriptVersion)"
 
-Write-Host "Starting upgrade using script version: $($Version)"
 
 # ========================================
 # Variables: Script Configuration
 # ========================================
-[int]$MinRequiredFreeSpaceGB = 30
-$Win11WorkingDirectory = 'C:\Temp\Win11'
 $upgradeArgs = "/quietinstall /skipeula /auto upgrade /copylogs $Win11WorkingDirectory"
+
 
 # ========================================
 # Variables: ServiceUI
 # ========================================
-# IMPORTANT: Set this to your own Azure Blob Storage URL containing ServiceUI.exe
-# OR
-# Place ServiceUI.exe in the root of your Win32 package and set this to: "$PSScriptRoot\ServiceUI.exe"
-# (This script does NOT host or provide ServiceUI.exe.)
-
-$ServiceUIPath = "$PSScriptRoot\ServiceUI.exe"
-#$ServiceUIPath = "'https://<YOUR URL>/serviceui/ServiceUI.exe'"
 $ServiceUIDestination = "$Win11WorkingDirectory\ServiceUI.exe"
 
 
 # ========================================
-# Variables: Registry Paths (for clearing upgrade blocks)
+# Variables: Used for the compat appraiser
 # ========================================
+$CompatAppraiserPath = 'C:\Windows\system32\CompatTelRunner.exe'
 $RegistryPathAppCompat = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\TargetVersionUpgradeExperienceIndicators\'
 $RegValueGStatus = 'GStatus'
 $RegValueUpgEx = 'UpgEx'
 $RegValueRedReason = 'RedReason'
 
-# ========================================
-# Variables: Compatibility Appraiser
-# ========================================
-$CompatAppraiserPath = 'C:\Windows\System32\CompatTelRunner.exe'
 
 # ========================================
-# Variables: For idle process check
+# Variables: For idle process check (mostly unused since v21)
 # ========================================
 $monitoredExeName = "windows10upgraderapp.exe"
 $monitoredProcName = [System.IO.Path]::GetFileNameWithoutExtension($monitoredExeName)
@@ -208,6 +214,12 @@ $monitoredProcName = [System.IO.Path]::GetFileNameWithoutExtension($monitoredExe
 $elapsedSeconds = 0
 [int]$checkIntervalSeconds = 15
 [int]$maxWaitSeconds = 7200  # 2 hours
+
+
+# ========================================
+# Variables: Default time (min) to sleep when caling sleepNow
+# ========================================
+[int]$sleepTime = 30
 
 # ------------------------------------
 # End Defining Script Variables
@@ -286,8 +298,6 @@ Else {
         # Always write to file
         $formattedMessage | Out-File -FilePath $LogFile -Append -Encoding UTF8
     }
-
-
     
     function Clean-Drivers {
         <#
@@ -337,7 +347,6 @@ Else {
         if ($unsignedDrivers.Count -gt 0) {
             $unsignedDrivers | Export-Csv -Path $driverLog -NoTypeInformation
             LogMessage -message ("Logged unsigned drivers to $driverLog") -Type 1 -Component 'Clean-Drivers'
-
 
             # Remove associated printers first
             LogMessage -message ("Removing printers using unsigned drivers...") -Type 1 -Component 'Clean-Drivers'
@@ -404,7 +413,6 @@ Else {
         }
         return $disk.PartitionStyle
     }
-
     
     function IsProcessIdle {
         <#
@@ -482,7 +490,7 @@ Else {
             }
             catch {
                 # Handle cases where Get-Counter fails (e.g., instance not found)
-                LogMessage -message "Failed to sample CPU for $ProcessName: $($_.Exception.Message)" -Type 3 -Component 'Upgrade'
+                LogMessage -message "Failed to sample CPU for $($ProcessName): $($_.Exception.Message)" -Type 3 -Component 'Upgrade'
                 $idleSeconds = 0
             }
 
@@ -492,6 +500,50 @@ Else {
 
         LogMessage -message "$ProcessName did not become idle in time. Max wait of $($MaxWaitSeconds / 60) minutes exceeded." -Type 3 -Component 'Upgrade'
         return $false
+    }
+
+
+    function SleepNow {
+        <#
+    .SYNOPSIS
+    Pauses script execution for a specified number of minutes with periodic logging.
+
+    .DESCRIPTION
+    This function puts the script to sleep for a given number of minutes. During the sleep,
+    it logs a message every 60 seconds showing the remaining time, and then logs a final 
+    message when the wait period is over.
+
+    .PARAMETER Length
+    The number of minutes to sleep.
+
+    .OUTPUTS
+    None. This function is used for timing and logging purposes only.
+
+    .EXAMPLE
+    SleepNow -Length 15
+    Logs a message every minute for 15 minutes, then logs "Time to wake up sleepy head!".
+    #>
+
+        param (
+            [Parameter(Mandatory = $true)]
+            [int]$Length  # Length in minutes
+        )
+
+        $totalSeconds = $Length * 60
+        $remaining = $totalSeconds
+
+        while ($remaining -gt 0) {
+            Start-Sleep -Seconds 60
+            $remaining -= 60
+
+            if ($remaining -gt 0) {
+                $minutes = [int]($remaining / 60)
+                $seconds = $remaining % 60
+                LogMessage -message ("Sleeping for another $minutes min and $seconds second") -Component 'SleepNow'
+            }
+        }
+
+        LogMessage -message ("Time to wake up sleepy head!") -Component 'SleepNow'
     }
 
 
@@ -599,7 +651,6 @@ Else {
             LogMessage -message ("ERROR: Cannot restore WinRE. Backup not found at $backupFile") -Type 3 -Component 'Restore-WinRE'
         }
     }
-
     
     function Get-WinREInfo {
         <#
@@ -729,7 +780,6 @@ Else {
         }
     }
   
-
     function Disable-WinRE {
         <#
         .SYNOPSIS
@@ -760,7 +810,6 @@ Else {
             return $false
         }
     }
-
  
     function Enable-WinRE {
         <#
@@ -867,7 +916,6 @@ Else {
             return @()
         }
     }    
-
     
     function Delete-Fonts { 
         <#
@@ -1305,23 +1353,28 @@ Else {
    
             # Get the RE version info since we are already getting other WinRE info.
             # This is used for the updates not the resize.
-            $WindowsRELocation = "$WinRELocation\winre.wim"
+            $WindowsRELocation = $WinREStatus.ImagePath
             $WindowsRELocationTrimmed = $WindowsRELocation.Trim()
             $DismImageFileArg = "/ImageFile:$WindowsRELocationTrimmed"
-            $Output = Dism /Get-ImageInfo $DismImageFileArg /index:1
+            LogMessage -message ("WinRELOcation: $WindowsRELocation")
+            LogMessage -message ("WinRELOcation: $WindowsRELocationTrimmed")
+            LogMessage -message ("WinRELOcation: $DismImageFileArg")   
+            
+            
+            
             # Use Select-String to find the specific lines for Version, ServicePack Build, and ServicePack Level
-            $version = ($output | Select-String -Pattern '^Version\s+:\s+').ToString().Split(":")[1].Trim()
+            $reVersion = ($output | Select-String -Pattern '^Version\s+:\s+').ToString().Split(":")[1].Trim()
             $spBuild = ($output | Select-String -Pattern 'ServicePack Build').ToString().Split(":")[1].Trim()
             $spLevel = ($output | Select-String -Pattern 'ServicePack Level').ToString().Split(":")[1].Trim()
             # Output the extracted values
-            "Version: $version"
+            "Version: $reVersion"
             "ServicePack Build: $spBuild"
             "ServicePack Level: $spLevel"
             # Extract the ServicePack Build and convert it to an integer
             $spBuild = ($output | Select-String -Pattern 'ServicePack Build').ToString().Split(":")[1].Trim()
             $spBuildInt = [int]$spBuild
             "ServicePack Build (Integer): $spBuildInt"
-            $versionInt = [Version]$version
+            $reVersionInt = [Version]$reVersion
 
             # Run the Microsoft function that checks and resizes the disk
             # See this: https://support.microsoft.com/en-us/topic/kb5035679-instructions-to-run-a-script-to-resize-the-recovery-partition-to-install-a-winre-update-98502836-cb2c-4d9a-874c-23bcdf16cd45
@@ -1330,9 +1383,9 @@ Else {
 
             # Update WinRE if needed  
             if ($OS -contains "Windows 10") {
-                if ($versionInt) {
-                    if ($versionInt -ge 10.0.19041.5025) {
-                        LogMessage -message ("WinRE version $($version) is greater than or equal to 10.0.19041.5025. No update required.")
+                if ($reVersionInt) {
+                    if ($reVersionInt -ge 10.0.19041.5025) {
+                        LogMessage -message ("WinRE version $($reVersion) is greater than or equal to 10.0.19041.5025. No update required.")
                         Return
                     }
                     else {
@@ -1399,30 +1452,30 @@ Else {
 
         ### BEGIN - Run the disk cleanup wizard ####
         $Freespace = (Get-WmiObject win32_logicaldisk -filter "DeviceID='C:'" | Select Freespace).FreeSpace / 1GB
-        LogMessage -message ("Freespace before cleanup: $($FreeSpace) GB") -Component 'Clean-Drivers'
+        LogMessage -message ("Freespace before cleanup: $($FreeSpace) GB") -Component 'Disk-Cleanup'
         IF ($FreeSpace -le $MinRequiredFreeSpaceGB) {
             $Flags = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches\*' -Name StateFlags1234 -ErrorAction SilentlyContinue
             if ($Flags) {
-                LogMessage -message ('Found flags value') -Component 'Clean-Drivers'
+                LogMessage -message ('Found flags value') -Component 'Disk-Cleanup'
                 Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches\*' -Name StateFlags1234 | Remove-ItemProperty -Name StateFlags1234 -Force -ErrorAction SilentlyContinue
             }
             else {
-                LogMessage -message ('No flag values found') -Component 'Clean-Drivers'
+                LogMessage -message ('No flag values found') -Component 'Disk-Cleanup'
             }
 
-            LogMessage -message ('Enabling cleanup options.') -Component 'Clean-Drivers'
+            LogMessage -message ('Enabling cleanup options.') -Component 'Disk-Cleanup'
             Get-ChildItem -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches' | New-ItemProperty -Name StateFlags1234 -Value 2 -PropertyType DWORD -Force
-            LogMessage -message ('CleanMgr Starting') -Component 'Clean-Drivers'
+            LogMessage -message ('CleanMgr Starting') -Component 'Disk-Cleanup'
 
             Start-Process -FilePath CleanMgr.exe -ArgumentList '/sagerun:1234' -WindowStyle Hidden -Wait
 
-            LogMessage -message ('Cleanup complete') -Component 'CleanMgr'
+            LogMessage -message ('Cleanup complete') -Component 'Disk-Cleanup'
             $Freespace = (Get-WmiObject win32_logicaldisk -filter "DeviceID='C:'" | select Freespace).FreeSpace / 1GB
-            LogMessage -message ("Freespace after cleanup: $($FreeSpace) GB") -Component 'Clean-Drivers'     
+            LogMessage -message ("Freespace after cleanup: $($FreeSpace) GB") -Component 'Disk-Cleanup'     
 
         }
         Else {
-            LogMessage -message ("Free space is good with: $($FreeSpace) GB") -Component 'Clean-Drivers'
+            LogMessage -message ("Free space is good with: $($FreeSpace) GB") -Component 'Disk-Cleanup'
         }
         ### END - Run the disk cleanup wizard ####
     
@@ -1430,32 +1483,32 @@ Else {
         LogMessage -message ('Detecting Red reasons, clear them, re-run appraiser')
 
         LogMessage -message ('Getting G Status Paths')
-        $GStatusPaths = Get-ChildItem -Recurse $REGPath | Get-KeyPath | Where-Object name -eq $GStatus | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+        $GStatusPaths = Get-ChildItem -Recurse $RegistryPathAppCompat | Get-KeyPath | Where-Object Name -eq $RegValueGStatus | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
         if ($GStatusPaths) {
             LogMessage -message ('Found G Status Paths') -Component 'Appraiser'
             $GStatusArray = New-Object System.Collections.ArrayList
             foreach ($Path in $GStatusPaths) {
-                LogMessage -message ("Checking path: $($Path)") -Component 'Appraiser'
-                $GStatusArray.Add((Get-ItemPropertyValue -Path $path -Name $GStatus))        
+                LogMessage -message ("Checking path: $Path") -Component 'Appraiser'
+                $GStatusArray.Add((Get-ItemPropertyValue -Path $Path -Name $RegValueGStatus))        
             }
         }
 
         LogMessage -message ('Getting Upg Ex Paths') -Component 'Appraiser' 
-        $UpgExPaths = Get-ChildItem -Recurse $REGPath | Get-KeyPath | Where-Object name -eq $UpgEx | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+        $UpgExPaths = Get-ChildItem -Recurse $RegistryPathAppCompat | Get-KeyPath | Where-Object Name -eq $RegValueUpgEx | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
         if ($UpgExPaths) {
             LogMessage -message ('Found Upg Ex Paths') -Component 'Appraiser'
             $UpgExArray = New-Object System.Collections.ArrayList
             foreach ($Path in $UpgExPaths) {
-                LogMessage -message ("Checking path: $($Path)") -Component 'Appraiser'
-                $UpgExArray.Add((Get-ItemPropertyValue -Path $path -Name $UpgEx))  
-                  
+                LogMessage -message ("Checking path: $Path") -Component 'Appraiser'
+                $UpgExArray.Add((Get-ItemPropertyValue -Path $Path -Name $RegValueUpgEx))  
             }
         }
+
         # If any key is not good delete them all and run the appraiser
-        if ($UpgExArray -contains 'Red' -or $GStatusArray -eq $null -or $GStatusArray.Count -eq 0 -or $GStatusArray -notcontains '2' -or ($GStatusArray -contains '2' -and $GStatusArray -ne '2') ) {
-            $Red = $True
-            $RedValues = @()
-            $RedPaths = Get-ChildItem -Recurse $REGPath | Get-KeyPath | Where-Object name -eq $RedReason | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+        if ($UpgExArray -contains 'Red' -or $GStatusArray -eq $null -or $GStatusArray.Count -eq 0 -or $GStatusArray -notcontains '2' -or ($GStatusArray -contains '2' -and $GStatusArray -ne '2')) {
+            $Red = $true
+            $RedValues = @() # Added to track removals but not implemented yet - PJM
+            $RedPaths = Get-ChildItem -Recurse $RegistryPathAppCompat | Get-KeyPath | Where-Object Name -eq $RegValueRedReason | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
 
             # Delete all the redreasons
             foreach ($Path in $RedPaths) {
@@ -1467,65 +1520,56 @@ Else {
             $Markers = Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\CompatMarkers\' | Select-Object -ExpandProperty Name 
             foreach ($Marker in $Markers) {
                 LogMessage -message ('Found markers. Delete them!') -Component 'Appraiser'
-                Remove-Item -path Registry::$Marker -ErrorAction SilentlyContinue
+                Remove-Item -Path "Registry::$Marker" -ErrorAction SilentlyContinue
             }
 
             $Caches = Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Appraiser\WuCache\' | Select-Object -ExpandProperty Name 
             foreach ($Cache in $Caches) {
                 LogMessage -message ('Found caches. Delete them!') -Component 'Appraiser'
-                Remove-Item -path Registry::$Cache -ErrorAction SilentlyContinue
+                Remove-Item -Path "Registry::$Cache" -ErrorAction SilentlyContinue
             }
 
-            # Force the compatibility appraisers to run:
-            LogMessage -message ("Appraiser path: $($CompatAppraiserPath)") -Component 'Appraiser'
-            Test-Path "$CompatAppraiserPath" -Verbose
-            if (Test-Path "$CompatAppraiserPath") {
-                LogMessage -message ('Found valid appraiser path. Run the appraisers') -Component 'Appraiser'
-                                
-                LogMessage -message ('Running DoScheduledTelemetryRun appraiser') -Component 'Appraiser'
+            LogMessage -message ("Appraiser path: $CompatAppraiserPath") -Component 'Appraiser'
+            if (Test-Path $CompatAppraiserPath) {
+                LogMessage -message ('Running compatibility appraisers...') -Component 'Appraiser'
+                
+                # Force the compatibility appraiser to run:
                 Start-Process -FilePath $CompatAppraiserPath -ArgumentList '-m:appraiser.dll -f:DoScheduledTelemetryRun' -WindowStyle Hidden -Wait -PassThru
-                LogMessage -message ('Running UpdateAvStatus appraiser') -Component 'Appraiser'
                 Start-Process -FilePath $CompatAppraiserPath -ArgumentList '-m:appraiser.dll -f:UpdateAvStatus' -WindowStyle Hidden -Wait -PassThru
-                LogMessage -message ('Running CreateDeviceInventory appraiser') -Component 'Appraiser'
                 Start-Process -FilePath $CompatAppraiserPath -ArgumentList '-m:devinv.dll -f:CreateDeviceInventory' -WindowStyle Hidden -Wait -PassThru
-                LogMessage -message ('Running QueryEncapsulationSettings appraiser') -Component 'Appraiser'
                 Start-Process -FilePath $CompatAppraiserPath -ArgumentList '-m:pcasvc.dll -f:QueryEncapsulationSettings' -WindowStyle Hidden -Wait -PassThru
-                LogMessage -message ('Running RunUpdate appraiser') -Component 'Appraiser'
                 Start-Process -FilePath $CompatAppraiserPath -ArgumentList '-m:invagent.dll -f:RunUpdate' -WindowStyle Hidden -Wait -PassThru
-                LogMessage -message ('Running BackupMareData appraiser') -Component 'Appraiser'
                 Start-Process -FilePath $CompatAppraiserPath -ArgumentList '-m:aemarebackup.dll -f:BackupMareData' -WindowStyle Hidden -Wait -PassThru
-             
+
                 # Retest for bad things:
-                LogMessage -message ('Retest for bad things.') -Component 'Appraiser'
-                $GStatusPaths = Get-ChildItem -Recurse $REGPath | Get-KeyPath | Where-Object name -eq $GStatus | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+                LogMessage -message ('Retest for upgrade blockers') -Component 'Appraiser'
+                $GStatusPaths = Get-ChildItem -Recurse $RegistryPathAppCompat | Get-KeyPath | Where-Object Name -eq $RegValueGStatus | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
                 if ($GStatusPaths) {
-                    LogMessage -message ('WARNING: Found new G Status Paths') -Component 'Appraiser'
                     $GStatusArray = New-Object System.Collections.ArrayList
                     foreach ($Path in $GStatusPaths) {
-                        $GStatusArray.Add((Get-ItemPropertyValue -Path $path -Name $GStatus))        
+                        $GStatusArray.Add((Get-ItemPropertyValue -Path $Path -Name $RegValueGStatus))        
                     }
                 }
 
-                $UpgExPaths = Get-ChildItem -Recurse $REGPath | Get-KeyPath | Where-Object name -eq $UpgEx | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+                $UpgExPaths = Get-ChildItem -Recurse $RegistryPathAppCompat | Get-KeyPath | Where-Object Name -eq $RegValueUpgEx | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
                 if ($UpgExPaths) {
-                    LogMessage -message ('WARNING: Found new Upg Ex Paths') -Component 'Appraiser'
                     $UpgExArray = New-Object System.Collections.ArrayList
                     foreach ($Path in $UpgExPaths) {
-                        $UpgExArray.Add((Get-ItemPropertyValue -Path $path -Name $UpgEx))      
+                        $UpgExArray.Add((Get-ItemPropertyValue -Path $Path -Name $RegValueUpgEx))      
                     }
                 }
 
-                if ($UpgExArray -contains 'Red' -or $GStatusArray -eq $null -or $GStatusArray.Count -eq 0 -or $GStatusArray -notcontains '2' -or ($GStatusArray -contains '2' -and $GStatusArray -ne '2') ) {
-                    LogMessage -message ('ERROR: Found new upgrade blockers!') -Component 'Appraiser'
-                    LogMessage -message ("$UpgExArray") -Component 'Appraiser'
+                if ($UpgExArray -contains 'Red' -or $GStatusArray -eq $null -or $GStatusArray.Count -eq 0 -or $GStatusArray -notcontains '2' -or ($GStatusArray -contains '2' -and $GStatusArray -ne '2')) {
+                    LogMessage -message ('ERROR: Found new upgrade blockers!') -Component 'Appraiser'               
                 }
                 else {
-                    LogMessage -message ("Resolved") -Component 'Appraiser'
+                    LogMessage -message ('Resolved') -Component 'Appraiser'
                 }
             }
             else {
-                LogMessage -message ("Error: Appraiser not found at path: $($CompatAppraiserPath)") -Component 'Appraiser'
+                LogMessage -message ("ERROR: Appraiser not found at path: $CompatAppraiserPath") -Component 'Appraiser'
             }
+
             LogMessage -message ('END - Detecting Red reasons, clear them, re-run appraiser') -Component 'Appraiser'
             ### END - Detecting Red reasons, clear them, re-run appraiser  ###
         }  
@@ -1652,86 +1696,55 @@ Else {
             LogMessage -message ("Found previously downloaded Windows 11 Installation Assistant.") -Component 'Script'
         } 
 
+        # Prestage regkeys for the disk cleanup wizard to run after first login to Windows 11
+        LogMessage -message ("Prestage regkeys for the disk cleanup wizard to run after first login to Windows 11") -Component 'ScheduledTask'
+        Get-ChildItem -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches' |
+            ForEach-Object {
+                New-ItemProperty -Path $_.PsPath -Name StateFlags1234 -Value 2 -PropertyType DWORD -Force
+            }
+    
+        # Create scheduled task to reclaim disk space at first login.
+        $taskName = "OneTimeCleanMgrAfterWin11Upgrade"
+        $scriptPath = "C:\Windows\Temp\$taskName.ps1"
+
+        # Build the actual script content separately (easy to indent and maintain)
+        $taskScript = @"
+Start-Process CleanMgr.exe -ArgumentList '/sagerun:1234' -WindowStyle Hidden -Wait
+Unregister-ScheduledTask -TaskName '$taskName' -Confirm:\$false
+"@
+
+        # Write it to disk
+        Set-Content -Path $scriptPath -Value $taskScript -Encoding UTF8
+
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`""
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERNAME" -LogonType Interactive -RunLevel Limited
+
+        # Register the task
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force
+
+
         #  Start Windows 11 Installation Assistant with or without ServiceUI        
         try {
             if ($loggedOnUsers.Count -gt 0 -and (Test-Path $serviceUIPath)) {
                 # Logged-on users detected and ServiceUI exists
                 LogMessage -message ("Starting Windows11InstallationAssistant.exe through ServiceUI.exe (visible to user)...") -Component 'Upgrade'
-                $proc = Start-Process -FilePath $serviceUIPath -ArgumentList "-process:explorer.exe `"$Windows11InstallationAssistantPath`" $upgradeArgs" -PassThru
+                $proc = Start-Process -FilePath $serviceUIPath -ArgumentList "-process:explorer.exe `"$Windows11InstallationAssistantPath`" $upgradeArgs" -PassThru                
             }
             else {
                 # No users detected or ServiceUI missing - run directly
-                LogMessage -message ("Starting Windows11InstallationAssistant.exe directly (no logged-on user detected)...") -Component 'Upgrade'
-                $proc = Start-Process -FilePath $Windows11InstallationAssistantPath -ArgumentList $upgradeArgs -PassThru
+                LogMessage -message ("Starting Windows11InstallationAssistant.exe directly (Failed to detect logged on user or path to serviceui.exe)...") -Component 'Upgrade'
+                $proc = Start-Process -FilePath $Windows11InstallationAssistantPath -ArgumentList $upgradeArgs -PassThru               
             }
             LogMessage -message ("Started Windows11InstallationAssistant.exe with process id $($proc.Id).") -Component 'Upgrade'
+            SleepNow -Length $sleepTime
         }
         catch {
             LogMessage -message ("Failed to start Windows11InstallationAssistant.exe. Error: $_") -Type 3 -Component 'Upgrade'
             try { Stop-Transcript } catch {}
             throw "Failed to start upgrade process."
-        }
-
+        }     
         
-        # ---------------------------------------------------------------
-        # Monitor the upgrade process:
-        # - Waits 60 seconds for windows10upgraderapp.exe to launch.
-        # - Monitors CPU usage for windows10upgraderapp.exe.
-        # - Waits for both windows10upgraderapp.exe and SetupHost.exe to stay below 1% CPU for $cpuIdleThresholdMinutes.
-        # - Exits successfully if both idle thresholds are met or the upgrade process exits.
-        # - Logs a warning and exits if timeout (2 hours) is reached.
-        # ---------------------------------------------------------------
-
-        # Allow process to launch
-        Start-Sleep -Seconds 60
-
-        do {
-            Start-Sleep -Seconds $checkIntervalSeconds
-            $elapsedSeconds += $checkIntervalSeconds
-
-            $procRunning = Get-Process -Name $monitoredProcName -ErrorAction SilentlyContinue
-            $remainingSeconds = [math]::Max(0, $timeoutSeconds - $elapsedSeconds)
-            $timeString = "{0:D2}:{1:D2}" -f ([int]($remainingSeconds / 60)), ($remainingSeconds % 60)
-
-            if (-not $procRunning) {
-                LogMessage -message "$monitoredExeName exited after $elapsedSeconds seconds. Assuming upgrade completed." -Component 'Upgrade'
-                break
-            }
-
-            try {
-                $cpuUsage = (Get-Counter "\Process($monitoredProcName*)\% Processor Time").CounterSamples.CookedValue
-                $cpuUsageAvg = [math]::Round(($cpuUsage | Measure-Object -Average).Average, 2)
-
-                if ($cpuUsageAvg -lt 1) {
-                    LogMessage -message "$monitoredExeName CPU usage < 1%. Waiting $cpuIdleThresholdMinutes minutes for sustained idle..." -Component 'Upgrade'
-
-                    if (IsProcessIdle -ProcessName $monitoredProcName -IdleMinutes $cpuIdleThresholdMinutes -MaxWaitSeconds ($timeoutSeconds - $elapsedSeconds)) {
-                        if (IsProcessIdle -ProcessName "SetupHost" -ExpectedPathPart "\$WINDOWS.~BT\Sources" -IdleMinutes $cpuIdleThresholdMinutes -MaxWaitSeconds ($timeoutSeconds - $elapsedSeconds)) {
-                            if (IsProcessIdle -ProcessName $monitoredProcName -IdleMinutes $cpuIdleThresholdMinutes -MaxWaitSeconds ($timeoutSeconds - $elapsedSeconds)) {
-                                LogMessage -message "Both $monitoredExeName and SetupHost.exe are idle. Proceeding." -Type 2 -Component 'Upgrade'
-                                break
-                            }
-                            else {
-                                LogMessage -message "$monitoredExeName was not idle after recheck. Continuing to monitor." -Component 'Upgrade'
-                            }
-                        }
-                        else {
-                            LogMessage -message "SetupHost.exe did not remain idle. Continuing to monitor." -Component 'Upgrade'
-                        }
-                    }
-                }
-            }
-            catch {
-                LogMessage -message ("Unknown Get-Counter error!") -Type 3 -Component 'Upgrade'
-            }
-
-            LogMessage -message "$monitoredExeName still running. Waiting... [$timeString remaining]" -Component 'Upgrade'
-
-        } while ($elapsedSeconds -lt $timeoutSeconds)
-
-        if (Get-Process -Name $monitoredProcName -ErrorAction SilentlyContinue) {
-            LogMessage -message "WARNING: $monitoredExeName still running after $timeoutSeconds seconds. Moving on without waiting further." -Type 2 -Component 'Upgrade'
-        }
     }
 }
 Stop-Transcript
