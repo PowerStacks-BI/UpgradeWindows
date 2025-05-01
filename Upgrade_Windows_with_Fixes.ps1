@@ -99,6 +99,9 @@ Contact: https://x.com/MEM_MVP
 20 - April 30, 2025
 - Added support for placing serviceui.exe into the Win32 package
 
+20.1 - May 10, 2025
+- Patched line 485
+
 
 .EXAMPLE
 To execute the script manually:
@@ -482,7 +485,7 @@ Else {
             }
             catch {
                 # Handle cases where Get-Counter fails (e.g., instance not found)
-                LogMessage -message "Failed to sample CPU for $ProcessName: $($_.Exception.Message)" -Type 3 -Component 'Upgrade'
+                LogMessage -message "Failed to sample CPU for ${ProcessName}: $($_.Exception.Message)" -Type 3 -Component 'Upgrade'
                 $idleSeconds = 0
             }
 
