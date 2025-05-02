@@ -110,6 +110,12 @@ Contact: https://x.com/MEM_MVP
     - $MinRequiredFreeSpaceGB
 - Added creation of scheduled task to reclaim disk space at first login (If Win11)
 
+22 - May 2, 2025
+- Added support for preserving language files other than EN-US
+- Several reports of missing WinRE.wim have come in from previous versions. This version attempts to correct that. 
+- Added skipping risky operations if we have no WinRE backup.
+- Log function now attempts to log line number of errors. 
+- Stole, and implemented, some code from Gary to improve https://garytown.com/low-space-on-efi-system-partition-clean-up cleanp of the system reserved partition
 
 .EXAMPLE
 To execute the script manually:
@@ -148,7 +154,7 @@ param (
 # ---------------------------------------------------------------------------------------------------
 if ("$env:PROCESSOR_ARCHITEW6432" -ne "ARM64") {
     Write-Host "Not on ARM64"
-    if (Test-Path "$($env:WINDIR)\SysNative\WindowsPowerShell\v1.0\powershell.exe") {    
+    if (Test-Path "$($env:WINDIR)\SysNative\WindowsPowerShell\v1.0\powershell.exe") {   
 
         
         # Relaunch as 64-bit
@@ -167,7 +173,7 @@ if ("$env:PROCESSOR_ARCHITEW6432" -ne "ARM64") {
 # ------------------------------------
 # Script Version Info
 # ------------------------------------
-[int]$ScriptVersion = 21.2
+[int]$ScriptVersion = 22
 
 
 # ========================================
@@ -185,6 +191,13 @@ Write-Host "Starting upgrade using script version: $($ScriptVersion)"
 # Variables: Script Configuration
 # ========================================
 $upgradeArgs = "/quietinstall /skipeula /auto upgrade /copylogs $Win11WorkingDirectory"
+
+
+# ========================================
+# Languages to keep (use RFC 5646 format)
+# Use a comma seperated list if you need more languages
+# ========================================
+$PreserveLanguages = @('en-US')
 
 
 # ========================================
@@ -242,32 +255,25 @@ Else {
 
     function LogMessage {
         <#
-        .SYNOPSIS
-        Writes a formatted log message to both the console and a persistent log file.
+    .SYNOPSIS
+    Writes a formatted log message to both the console and a persistent log file, including the line number.
 
-        .DESCRIPTION
-        This function logs messages with a timestamp, severity level (INFO, WARN, ERROR), and an optional component label. 
-        It outputs messages to the console using color-coding and always appends the same message to the global log file defined by $LogFile.
+    .DESCRIPTION
+    Logs messages with timestamp, severity level (INFO, WARN, ERROR), component name, and the script line number.
 
-        .PARAMETER Message
-        The message text to log. Required.
+    .PARAMETER Message
+    The message text to log.
 
-        .PARAMETER Component
-        An optional label identifying the component or function emitting the log message. Defaults to 'Script'.
+    .PARAMETER Component
+    An optional label for the log source (e.g., a function name). Defaults to 'Script'.
 
-        .PARAMETER Type
-        An integer indicating the severity level:
-        1 = INFO (gray), 2 = WARN (yellow), 3 = ERROR (red). Defaults to 1.
+    .PARAMETER Type
+    1 = INFO, 2 = WARN, 3 = ERROR
 
-        .EXAMPLE
-        LogMessage -Message "Starting WinRE analysis" -Component "Get-WinREInfo"
+    .OUTPUTS
+    Writes to both screen and $LogFile
+    #>
 
-        .EXAMPLE
-        LogMessage -Message "Failed to detect UEFI mode" -Component "BootCheck" -Type 3
-
-        .NOTES
-        Output is written to both the screen and to $LogFile.
-        #>
         param (
             [Parameter(Mandatory = $true)]
             [string]$Message,
@@ -275,7 +281,7 @@ Else {
             [string]$Component = "Script",
 
             [ValidateSet('1', '2', '3')]
-            [int]$Type = 1  # 1=Normal, 2=Warning, 3=Error
+            [int]$Type = 1
         )
 
         $timeStamp = Get-Date -Format "HH:mm:ss"
@@ -286,7 +292,12 @@ Else {
             3 { "ERROR" }
         }
 
-        $formattedMessage = "[${dateStamp} ${timeStamp}] [$levelText] [$Component] $Message"
+        # Try to get line number from call stack
+        $callStack = Get-PSCallStack
+        $caller = if ($callStack.Count -gt 1) { $callStack[1] } else { $null }
+        $lineInfo = if ($caller) { "Line $($caller.ScriptLineNumber)" } else { "Line ?" }
+
+        $formattedMessage = "[${dateStamp} ${timeStamp}] [$levelText] [$Component] [$lineInfo] $Message"
 
         # Output to console with color
         switch ($Type) {
@@ -298,6 +309,7 @@ Else {
         # Always write to file
         $formattedMessage | Out-File -FilePath $LogFile -Append -Encoding UTF8
     }
+
     
     function Clean-Drivers {
         <#
@@ -577,117 +589,145 @@ Else {
     
     function Backup-WinRE {
         <#
-        .SYNOPSIS
-        Backs up the existing WinRE.wim file to a safe location before performing partition modifications.
+    .SYNOPSIS
+    Backs up WinRE.wim and ReAgent.xml to C:\WinRE_Backup.
 
-        .DESCRIPTION
-        Copies the WinRE image from the default system recovery path (C:\Windows\System32\Recovery\WinRE.wim)
-        to a predefined backup directory (C:\WinRE_Backup). Ensures the backup folder exists and logs success or failure.
+    .DESCRIPTION
+    Copies both the recovery image (WinRE.wim) and configuration file (ReAgent.xml)
+    to C:\WinRE_Backup. Logs actions and returns $true if both backups succeed.
 
-        This function is called before any operation that may delete or modify the WinRE partition, such as resizing.
+    .OUTPUTS
+    [bool] - $true if both files were backed up, otherwise $false.
+    #>
 
-        .OUTPUTS
-        Boolean
-        Returns $true if the backup was successful, otherwise $false.
+        $sourceWim = "$env:SystemRoot\System32\Recovery\WinRE.wim"
+        $sourceXml = "$env:SystemRoot\System32\Recovery\ReAgent.xml"
+        $backupFolder = "C:\WinRE_Backup"
+        $backupWim = Join-Path $backupFolder "WinRE.wim"
+        $backupXml = Join-Path $backupFolder "ReAgent.xml"
 
-        .EXAMPLE
-        Backup-WinRE
-        # Attempts to copy WinRE.wim to C:\WinRE_Backup and logs the result.
-        #>
-        $sourcePath = "$env:SystemRoot\System32\Recovery\WinRE.wim"
-        $backupPath = "C:\winre_backup\WinRE.wim"
+        if (!(Test-Path $backupFolder)) {
+            New-Item -Path $backupFolder -ItemType Directory | Out-Null
+        }
 
-        LogMessage -message ("Backing up WinRE from $sourcePath to $backupPath") -Component 'Backup-WinRE'
+        $success = $true
 
-        if (Test-Path $sourcePath) {
+        if (Test-Path $sourceWim) {
             try {
-                Copy-Item -Path $sourcePath -Destination $backupPath -Force
-                LogMessage -message ("Backed up WinRE.wim to $backupPath") -Component 'Backup-WinRE'
-                return $true  
+                Copy-Item -Path $sourceWim -Destination $backupWim -Force
+                LogMessage -message "Backed up WinRE.wim to $backupWim" -Component 'Backup-WinRE'
             }
             catch {
-                LogMessage -message ("Failed to back up WinRE.wim: $($_.Exception.Message)") -Type 3 -Component 'Backup-WinRE'
-                return $false
+                LogMessage -message "Failed to back up WinRE.wim: $($_.Exception.Message)" -Type 3 -Component 'Backup-WinRE'
+                $success = $false
             }
         }
         else {
-            LogMessage -message ("No WinRE.wim found at $sourcePath to back up") -Type 2 -Component 'Backup-WinRE'
-            return $false
+            LogMessage -message "No WinRE.wim found at $sourceWim to back up" -Type 2 -Component 'Backup-WinRE'
+            $success = $false
         }
+
+        if (Test-Path $sourceXml) {
+            try {
+                Copy-Item -Path $sourceXml -Destination $backupXml -Force
+                LogMessage -message "Backed up ReAgent.xml to $backupXml" -Component 'Backup-WinRE'
+            }
+            catch {
+                LogMessage -message "Failed to back up ReAgent.xml: $($_.Exception.Message)" -Type 3 -Component 'Backup-WinRE'
+                $success = $false
+            }
+        }
+        else {
+            LogMessage -message "No ReAgent.xml found at $sourceXml to back up" -Type 2 -Component 'Backup-WinRE'
+            # not fatal, continue
+        }
+
+        return $success
     }
 
     function Restore-WinRE {
         <#
-        .SYNOPSIS
-        Restores the WinRE.wim file from backup if it was previously saved.
+    .SYNOPSIS
+    Restores the WinRE.wim and ReAgent.xml files from backup if they were previously saved.
 
-        .DESCRIPTION
-        Copies the backed-up WinRE image from C:\WinRE_Backup\WinRE.wim to the system recovery location at
-        C:\Windows\System32\Recovery\WinRE.wim. This is used to recover WinRE functionality if it was lost
-        or corrupted during disk partitioning or upgrade remediation operations.
+    .DESCRIPTION
+    Copies the backed-up WinRE image and configuration file from C:\WinRE_Backup to their original system locations
+    in C:\Windows\System32\Recovery. Re-registers the WinRE image using ReAgentC.
 
-        Checks for the existence of the backup file and logs the outcome of the restore process.
+    .OUTPUTS
+    [bool] - $true if restore and re-registration were successful, otherwise $false.
+    #>
 
-        .OUTPUTS
-        Boolean
-        Returns $true if the restore was successful, otherwise $false.
+        $backupFolder = "C:\WinRE_Backup"
+        $backupWim = Join-Path $backupFolder "WinRE.wim"
+        $backupXml = Join-Path $backupFolder "ReAgent.xml"
+        $recoveryFolder = "$env:SystemRoot\System32\Recovery"
+        $targetWim = Join-Path $recoveryFolder "WinRE.wim"
+        $targetXml = Join-Path $recoveryFolder "ReAgent.xml"
 
-        .EXAMPLE
-        Restore-WinRE
-        # Restores WinRE.wim from backup if needed and logs the operation.
-        #>
-        $backupFile = "C:\WinRE_Backup\WinRE.wim"
-        $targetPath = "$env:SystemRoot\System32\Recovery"
+        $restoreSuccess = $true
 
-        if (Test-Path $backupFile) {
-            Copy-Item -Path $backupFile -Destination (Join-Path $targetPath "WinRE.wim") -Force
-            LogMessage -message ("Restored WinRE.wim to $targetPath") -Component 'Restore-WinRE'
-
-            # Re-register WinRE image
-            reagentc /setreimage /path $targetPath /target $env:SystemRoot | Out-Null
-            LogMessage -message ("ReAgentc /setreimage executed.") -Component 'Restore-WinRE'
+        # --- Restore WinRE.wim ---
+        if (-not (Test-Path $targetWim) -and (Test-Path $backupWim)) {
+            try {
+                Copy-Item -Path $backupWim -Destination $targetWim -Force
+                LogMessage -message "Restored WinRE.wim to $targetWim" -Component 'Restore-WinRE'
+            }
+            catch {
+                LogMessage -message "Failed to restore WinRE.wim: $($_.Exception.Message)" -Type 3 -Component 'Restore-WinRE'
+                $restoreSuccess = $false
+            }
+        }
+        elseif (-not (Test-Path $backupWim)) {
+            LogMessage -message "Backup WinRE.wim not found at $backupWim" -Type 3 -Component 'Restore-WinRE'
+            $restoreSuccess = $false
         }
         else {
-            LogMessage -message ("ERROR: Cannot restore WinRE. Backup not found at $backupFile") -Type 3 -Component 'Restore-WinRE'
+            LogMessage -message "WinRE.wim already exists at $targetWim — no restore needed." -Component 'Restore-WinRE'
         }
+
+        # --- Restore ReAgent.xml ---
+        if (-not (Test-Path $targetXml) -and (Test-Path $backupXml)) {
+            try {
+                Copy-Item -Path $backupXml -Destination $targetXml -Force
+                LogMessage -message "Restored ReAgent.xml to $targetXml" -Component 'Restore-WinRE'
+            }
+            catch {
+                LogMessage -message "Failed to restore ReAgent.xml: $($_.Exception.Message)" -Type 2 -Component 'Restore-WinRE'
+                # not fatal
+            }
+        }
+        elseif (Test-Path $targetXml) {
+            LogMessage -message "ReAgent.xml already exists at $targetXml — no restore needed." -Component 'Restore-WinRE'
+        }
+
+        # --- Re-register WinRE image if WIM is now present ---
+        if (Test-Path $targetWim) {
+            try {
+                $output = ReAgentC.exe /setreimage /path $recoveryFolder /target $env:SystemRoot 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    LogMessage -message "ReAgentC /setreimage successful. Output:`n$($output -join "`n")" -Component 'Restore-WinRE'
+                }
+                else {
+                    LogMessage -message "ReAgentC /setreimage failed. Output:`n$($output -join "`n")" -Type 3 -Component 'Restore-WinRE'
+                    $restoreSuccess = $false
+                }
+            }
+            catch {
+                LogMessage -message "Exception occurred during ReAgentC /setreimage: $($_.Exception.Message)" -Type 3 -Component 'Restore-WinRE'
+                $restoreSuccess = $false
+            }
+        }
+        else {
+            LogMessage -message "WinRE.wim is still missing at $targetWim. Cannot re-register." -Type 3 -Component 'Restore-WinRE'
+            $restoreSuccess = $false
+        }
+
+        return $restoreSuccess
     }
+
     
     function Get-WinREInfo {
-        <#
-        .SYNOPSIS
-        Retrieves detailed information about the current WinRE (Windows Recovery Environment) partition.
-
-        .DESCRIPTION
-        This function gathers partition and disk layout information related to WinRE. It checks if the recovery agent is enabled,
-        parses the disk and partition number from `reagentc /info`, retrieves partition layout using PowerShell disk utilities,
-        and calculates available space using `Get-PartitionSupportedSize`.
-
-        The returned object contains useful WinRE metadata such as disk number, partition number, partition style, size,
-        free space, and position in the partition table.
-
-        If WinRE is disabled, missing, or incorrectly configured, the function returns $null and logs the issue.
-
-        .OUTPUTS
-        [PSCustomObject] with the following properties:
-        - ImagePath
-        - DiskNumber
-        - WinREImageLocation
-        - PartitionStyle
-        - LastPartition
-        - OSIsLast
-        - winREPartitionSizeMB
-        - winREPartitionFree
-        - winREPartitionFreeMB
-        - winREIsLast
-        - DiskIndex
-        - OSPartition
-        - winREPartitionNumber
-
-        .EXAMPLE
-        $info = Get-WinREInfo
-        if ($info) { Write-Host "WinRE partition size: $($info.winREPartitionSizeMB) MB" }
-        #>
-   
         LogMessage -message ("Retrieving current WinRE Info") -Type 1 -Component 'Get-WinREInfo'
 
         try {
@@ -699,37 +739,34 @@ Else {
 
                 [xml]$ReAgentXML = Get-Content "$env:SystemRoot\System32\Recovery\ReAgent.xml" -ErrorAction Stop
 
-                # Continue with analysis regardless of GUID
                 $WinREImagepath = "$env:SystemRoot\System32\Recovery\WinRE.wim"
 
                 $OSPartitionObject = Get-Partition -DriveLetter ($env:SystemDrive).Substring(0, 1)
                 $WinREImageLocationDisk = $OSPartitionObject.DiskNumber
                 $WinREImageLocationPartition = $OSPartitionObject.PartitionNumber
 
-                # Parse output for actual WinRE partition path
                 $ReAgentCCurrentDrive = $WinreInfo.split("`n")[4].Substring(31).Trim() -replace '\0', ''
                 $recoveryPathInfo = $ReAgentCCurrentDrive -replace '\\\?\\GLOBALROOT\\device\\', ''
 
-                if ($recoveryPathInfo -match 'harddisk(\d+).*partition(\d+)') {
+                if ($recoveryPathInfo -match 'harddisk(\\d+).*partition(\\d+)') {
                     $RecoveryDiskNumber = [int]$matches[1]
                     $RecoveryPartitionNumber = [int]$matches[2]
                 }
                 else {
                     LogMessage -message ("Unable to extract disk and partition number from ReAgentC output.") -Type 2 -Component 'Get-WinREInfo'
-                    return $null
+                    return @([PSCustomObject]@{ WinREStatus = "Disabled"; ImagePath = $null })
                 }
 
                 $RecoveryPartition = Get-Partition -DiskNumber $RecoveryDiskNumber -PartitionNumber $RecoveryPartitionNumber -ErrorAction SilentlyContinue
                 if (-not $RecoveryPartition) {
                     LogMessage -message ("Recovery partition not found.") -Type 2 -Component 'Get-WinREInfo'
-                    return $null
+                    return @([PSCustomObject]@{ WinREStatus = "Disabled"; ImagePath = $null })
                 }
 
                 $diskInfo = Get-Disk -Number $RecoveryDiskNumber
                 $PartitionStyle = $diskInfo.PartitionStyle
                 $LastPartitionNumber = (Get-Partition -DiskNumber $RecoveryDiskNumber | Sort-Object Offset | Select-Object -Last 1).PartitionNumber
 
-                # Try Get-PartitionSupportedSize
                 try {
                     $SupportedSize = Get-PartitionSupportedSize -DiskNumber $RecoveryDiskNumber -PartitionNumber $RecoveryPartitionNumber
                     $RecoveryPartitionSize = [math]::Round($RecoveryPartition.Size / 1MB, 2)
@@ -746,98 +783,135 @@ Else {
                 $OSIsLast = ($OSPartitionObject.PartitionNumber -eq $LastPartitionNumber)
                 $RecoveryIsLastPartition = ($RecoveryPartitionNumber -eq $LastPartitionNumber)
 
-                # Logging
                 LogMessage -message ("Recovery partition size: $($RecoveryPartitionSize) MB") -Type 1 -Component 'Get-WinREInfo'
                 LogMessage -message ("Recovery partition free space: $($RecoveryPartitionFreeMB) MB") -Type 1 -Component 'Get-WinREInfo'
                 LogMessage -message ("Recovery is last partition? $($RecoveryIsLastPartition)") -Type 1 -Component 'Get-WinREInfo'
                 LogMessage -message ("OS is last partition? $($OSIsLast)") -Type 1 -Component 'Get-WinREInfo'
                 LogMessage -message ("Partition Style: $($PartitionStyle)") -Type 1 -Component 'Get-WinREInfo'
 
-                return [PSCustomObject]@{
-                    ImagePath            = $WinREImagepath
-                    DiskNumber           = $WinREImageLocationDisk
-                    WinREImageLocation   = $WinREImageLocationPartition
-                    PartitionStyle       = $PartitionStyle
-                    LastPartition        = $LastPartitionNumber
-                    OSIsLast             = $OSIsLast
-                    winREPartitionSizeMB = $RecoveryPartitionSize
-                    winREPartitionFree   = $RecoveryPartitionFreeGB
-                    winREPartitionFreeMB = $RecoveryPartitionFreeMB
-                    winREIsLast          = $RecoveryIsLastPartition
-                    DiskIndex            = $WinREImageLocationDisk
-                    OSPartition          = $OSPartitionObject.PartitionNumber
-                    winREPartitionNumber = $RecoveryPartitionNumber
-                }
+                return @([PSCustomObject]@{
+                        WinREStatus          = "Enabled"
+                        ImagePath            = $WinREImagepath
+                        DiskNumber           = $WinREImageLocationDisk
+                        WinREImageLocation   = $WinREImageLocationPartition
+                        PartitionStyle       = $PartitionStyle
+                        LastPartition        = $LastPartitionNumber
+                        OSIsLast             = $OSIsLast
+                        winREPartitionSizeMB = $RecoveryPartitionSize
+                        winREPartitionFree   = $RecoveryPartitionFreeGB
+                        winREPartitionFreeMB = $RecoveryPartitionFreeMB
+                        winREIsLast          = $RecoveryIsLastPartition
+                        DiskIndex            = $WinREImageLocationDisk
+                        OSPartition          = $OSPartitionObject.PartitionNumber
+                        winREPartitionNumber = $RecoveryPartitionNumber
+                    })
             }
             else {
                 LogMessage -message ("Recovery Agent is NOT enabled.") -Type 2 -Component 'Get-WinREInfo'
-                return $null
+                return @([PSCustomObject]@{ WinREStatus = "Disabled"; ImagePath = $null })
             }
         }
         catch {
             LogMessage -message ("Failed to retrieve WinRE information: $($_.Exception.Message)") -Type 3 -Component 'Get-WinREInfo'
-            return $null
+            return @([PSCustomObject]@{ WinREStatus = "Error"; ImagePath = $null })
         }
     }
+
   
     function Disable-WinRE {
         <#
-        .SYNOPSIS
-        Disables the Windows Recovery Environment (WinRE) using reagentc.
+    .SYNOPSIS
+    Disables Windows Recovery Environment (WinRE).
 
-        .DESCRIPTION
-        Uses the reagentc.exe command-line tool to disable WinRE. Interprets common return conditions to determine
-        if the disable operation succeeded, failed, or was unnecessary (already disabled).
+    .DESCRIPTION
+    Uses ReAgentC.exe /disable. Returns $true if WinRE is successfully disabled or already disabled.
+    Returns $false on failure, and logs all actions.
 
-        Logs status and returns `$true` if WinRE was successfully disabled or already disabled.
-        Returns `$false` if the operation failed.
+    .OUTPUTS
+    [bool]
 
-        .OUTPUTS
-        [bool] - $true if WinRE was disabled or already disabled, otherwise $false.
+    .EXAMPLE
+    if (-not (Disable-WinRE)) {
+        Write-Host "Failed to disable WinRE"
+    }
+    #>
+        try {
+            $output = ReAgentC.exe /disable 2>&1
+            $exitCode = $LASTEXITCODE
 
-        .EXAMPLE
-        if (-not (Disable-WinRE)) {
-            Write-Host "Failed to disable WinRE"
+            if ($exitCode -eq 0) {
+                LogMessage -message "WinRE disabled successfully." -Type 1 -Component 'Disable-WinRE'
+                return $true
+            }
+            elseif ($exitCode -eq 2) {
+                LogMessage -message "WinRE was already disabled." -Type 1 -Component 'Disable-WinRE'
+                return $true
+            }
+            else {
+                LogMessage -message "Failed to disable WinRE. Exit code: $exitCode. Output: $($output -join "`n")" -Type 3 -Component 'Disable-WinRE'
+                return $false
+            }
         }
-        #>
-        $DisableRE = ReAgentc.exe /disable
-        if ($LASTEXITCODE -eq 2 -or ($LASTEXITCODE -eq 0 -and ($DisableRE) -and ($DisableRE[0] -notmatch ".*\d+.*"))) {
-            LogMessage -message ("Disabled WinRE") -Type 1 -Component 'Disable-WinRE'      
-            return $true
-        }
-        else {
-            LogMessage -message ("Disabling WinRE failed") -Type 1 -Component 'Disable-WinRE'
+        catch {
+            LogMessage -message "Exception occurred disabling WinRE: $($_.Exception.Message)" -Type 3 -Component 'Disable-WinRE'
             return $false
         }
     }
- 
+
     function Enable-WinRE {
         <#
-        .SYNOPSIS
-        Enables the Windows Recovery Environment (WinRE) using reagentc.
+    .SYNOPSIS
+    Enables the Windows Recovery Environment (WinRE) using ReAgentC.
 
-        .DESCRIPTION
-        Uses the reagentc.exe tool to re-enable WinRE after modifications. Validates success by checking the exit code
-        and parsing the output. Logs the result and returns a boolean indicating success or failure.
+    .DESCRIPTION
+    Validates that WinRE.wim exists before running ReAgentC.exe /enable.
+    Logs all output and confirms enablement by checking ReAgentC return code and running Get-WinREInfo afterward.
 
-        .OUTPUTS
-        [bool] - $true if WinRE was successfully enabled, otherwise $false.
+    .OUTPUTS
+    [bool] - $true if WinRE was successfully enabled, otherwise $false.
+    #>
 
-        .EXAMPLE
-        if (-not (Enable-WinRE)) {
-            LogMessage -message "Unable to re-enable WinRE." -Type 3
+        try {
+            $reInfo = Get-WinREInfo
+            if (-not $reInfo) {
+                LogMessage -message "Enable-WinRE: Unable to retrieve WinRE info (Get-WinREInfo returned null)." -Type 3 -Component 'Enable-WinRE'
+                return $false
+            }
+
+            $reImage = $reInfo.ImagePath
+            if (-not $reImage -or -not (Test-Path $reImage)) {
+                LogMessage -message "Cannot enable WinRE — WinRE.wim is missing at: $reImage" -Type 3 -Component 'Enable-WinRE'
+                return $false
+            }
+
+            $output = ReAgentC.exe /enable 2>&1
+            $exitCode = $LASTEXITCODE
+
+            if ($exitCode -eq 0) {
+                LogMessage -message "Enabled WinRE successfully. Output:`n$($output -join "`n")" -Type 1 -Component 'Enable-WinRE'
+
+                # Re-check status to confirm
+                $newStatus = Get-WinREInfo
+                if ($newStatus -and $newStatus.WinREStatus -eq 'Enabled') {
+                    return $true
+                }
+                else {
+                    LogMessage -message "ReAgentC returned success, but WinREStatus is still not enabled." -Type 3 -Component 'Enable-WinRE'
+                    return $false
+                }
+            }
+            else {
+                LogMessage -message "Failed to enable WinRE. Exit code: $exitCode. Output:`n$($output -join "`n")" -Type 3 -Component 'Enable-WinRE'
+                return $false
+            }
         }
-        #>
-        $EnableRE = ReAgentc.exe /enable
-        if ($LASTEXITCODE -eq 0 -and ($EnableRE[0] -notmatch ".*\d+.*")) {
-            LogMessage -Message ('Enabled WinRE') -Type 1 -Component 'Enable-WinRE'
-            return $true
-        }
-        else {
-            LogMessage -Message ('Enabling failed') -Type 3 -Component 'Enable-WinRE'
+        catch {
+            LogMessage -message "Exception occurred enabling WinRE: $($_.Exception.Message)" -Type 3 -Component 'Enable-WinRE'
             return $false
         }
     }
+    
+
 
     function Get-KeyPath {
         <#
@@ -919,26 +993,25 @@ Else {
     
     function Delete-Fonts { 
         <#
-        .SYNOPSIS
-        Deletes font files and non-English language folders from the EFI system partition to free space.
+    .SYNOPSIS
+    Deletes font files, non-English language folders, and select vendor firmware files from the EFI system partition to free space.
 
-        .DESCRIPTION
-        This function mounts the system reserved EFI partition using the first available drive letter, 
-        then removes all font files from the Fonts directory. It also deletes any language-specific 
-        folders except for "en-US". These actions help free up space required for Windows feature updates,
-        particularly to resolve the "We couldn't update the system reserved partition" error.
+    .DESCRIPTION
+    This function mounts the system reserved EFI partition using the first available drive letter, 
+    then removes all font files from the Fonts directory. It also deletes any language-specific 
+    folders except for those specified in $PreserveLanguages, and removes leftover firmware update directories
+    from vendors like HP. These actions help free up space required for Windows feature updates,
+    particularly to resolve the "We couldn't update the system reserved partition" error.
 
-        The function logs the free space before and after the operation, and ensures the volume is dismounted after changes.
+    .REFERENCE
+    https://support.microsoft.com/en-us/topic/-we-couldn-t-update-system-reserved-partition-error-installing-windows-10-46865f3f-37bb-4c51-c69f-07271b6672ac
+    https://garytown.com/low-space-on-efi-system-partition-clean-up
 
-        .Reference
-        https://support.microsoft.com/en-us/topic/-we-couldn-t-update-system-reserved-partition-error-installing-windows-10-46865f3f-37bb-4c51-c69f-07271b6672ac
+    .EXAMPLE
+    Delete-Fonts
+    #>
 
-        .EXAMPLE
-        Delete-Fonts
-        This will delete font files and extra language folders from the EFI partition and log the changes.
-        #>
         try {
-            # Dynamically find the first available drive letter
             $Letter = ls function:[d-z]: -n | Where-Object { !(Test-Path $_) } | Select-Object -First 1
             if (-not $Letter) {
                 LogMessage -Message ("No available drive letter found. Exiting.") -Type 3 -Component "Delete-Fonts"
@@ -947,19 +1020,16 @@ Else {
 
             LogMessage -Message ("Using drive letter: $Letter. Mounting system reserved partition.") -Type 1 -Component "Delete-Fonts"
 
-            # Mount the system reserved partition
             $mountOutput = & cmd /c "mountvol $Letter /s 2>&1"
             if (-not [string]::IsNullOrWhiteSpace($mountOutput)) {
                 LogMessage -Message ("Failed to mount volume. Error: $mountOutput") -Type 3 -Component "Delete-Fonts"
                 return
             }
 
-            # Log free space before deletion
             $SizeBefore = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { $_.DeviceID -eq "$Letter" } | Select-Object -ExpandProperty FreeSpace
             $mbBefore = [math]::Round($SizeBefore / 1MB)
             LogMessage -Message ("Free space before deletions: $($mbBefore)MB") -Type 1 -Component "Delete-Fonts"
 
-            # Remove font files
             try {
                 Get-Item "$($Letter)\EFI\Microsoft\Boot\Fonts\*.*" -ErrorAction Stop | Remove-Item -Force
                 LogMessage -Message "Fonts deleted successfully." -Type 1 -Component "Delete-Fonts"
@@ -969,18 +1039,20 @@ Else {
                 return
             }
 
-            # Remove extra language folders except en-US
             try {
                 $bootLangFolders = Get-ChildItem "$($Letter)\EFI\Microsoft\Boot" -Directory -ErrorAction Stop
-
                 foreach ($folder in $bootLangFolders) {
-                    # Only consider folders that match a language tag pattern like "xx-XX"
-                    if ($folder.Name -match '^[a-z]{2}-[A-Z]{2}$' -and $folder.Name -ne 'en-US') {
-                        Remove-Item -Path $folder.FullName -Recurse -Force -ErrorAction Stop
-                        LogMessage -Message "Deleted language folder: $($folder.Name)" -Type 1 -Component "Delete-Fonts"
+                    if ($folder.Name -match '^[a-z]{2}-[A-Z]{2}$') {
+                        if ($PreserveLanguages -contains $folder.Name) {
+                            LogMessage -Message "Preserved language folder: $($folder.Name)" -Type 1 -Component "Delete-Fonts"
+                        }
+                        else {
+                            Remove-Item -Path $folder.FullName -Recurse -Force -ErrorAction Stop
+                            LogMessage -Message "Deleted language folder: $($folder.Name)" -Type 1 -Component "Delete-Fonts"
+                        }
                     }
                     else {
-                        LogMessage -Message "Skipped folder (not a language folder or is en-US): $($folder.Name)" -Type 1 -Component "Delete-Fonts"
+                        LogMessage -Message "Skipped folder (not a language folder): $($folder.Name)" -Type 1 -Component "Delete-Fonts"
                     }
                 }
             }
@@ -989,24 +1061,41 @@ Else {
                 return
             }
 
+            # Additional cleanup based on Garytown article
+            $vendorPaths = @(
+                "$($Letter):\EFI\HP\BIOS\Previous",
+                "$($Letter):\EFI\HP\BIOS\Current",
+                "$($Letter):\EFI\HP\DEVFW",
+                "$($Letter):\EFI\Lenovo\fw",
+                "$($Letter):\EFI\Dell\BIOS",
+                "$($Letter):\EFI\ASUS\fw"
+            )
 
-            # Log free space after deletions
-            $SizeAfter = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { $_.DeviceID -eq "$Letter" } | Select-Object -ExpandProperty FreeSpace
-            $mbAfter = [math]::Round($SizeAfter / 1MB)
-            LogMessage -Message "Free space after deletions: $($mbAfter)MB" -Type 1 -Component "Delete-Fonts"
-
-            # Dismount the volume
-            $dismountOutput = & cmd /c "mountvol $Letter /d 2>&1"
-            if (-not [string]::IsNullOrWhiteSpace($dismountOutput)) {
-                LogMessage -Message "Failed to dismount volume. Error: $dismountOutput" -Type 3 -Component "Delete-Fonts"
-                return
+            foreach ($path in $vendorPaths) {
+                if (Test-Path $path) {
+                    try {
+                        Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+                        LogMessage -Message "Deleted vendor firmware folder: $path" -Type 1 -Component "Delete-Fonts"
+                    }
+                    catch {
+                        LogMessage -Message "Failed to delete vendor path $path. Error: $_" -Type 2 -Component "Delete-Fonts"
+                    }
+                }
             }
 
+            $SizeAfter = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { $_.DeviceID -eq "$Letter" } | Select-Object -ExpandProperty FreeSpace
+            $mbAfter = [math]::Round($SizeAfter / 1MB)
+            LogMessage -Message ("Free space after deletions: $($mbAfter)MB") -Type 1 -Component "Delete-Fonts"
+
+            # Unmount the EFI partition
+            & cmd /c "mountvol $Letter /d"
             LogMessage -Message "Successfully dismounted volume and completed deletions." -Type 1 -Component "Delete-Fonts"
 
+            return $true
         }
         catch {
-            LogMessage -Message "An unexpected error occurred: $_" -Type 3 -Component "Delete-Fonts"
+            LogMessage -Message "Exception occurred during font deletion: $($_.Exception.Message)" -Type 3 -Component "Delete-Fonts"
+            return $false
         }
     }
 
@@ -1192,7 +1281,8 @@ Else {
     LogMessage -message ("Start time: $([DateTime]::Now)") -Type 1 -Component "Script"
     LogMessage -message ("Examining the system...") -Type 1 -Component "Script"
 
-    # Check for the most basic requirements before doing anything else
+    
+    ### BEGIN - Checking for the most basic requirements ####
     LogMessage -message ("Check for the most basic requirements before doing anything else") -Type 1 -Component 'Script' 
     # Checks TPM 2.0, UEFI Boot, Secure Boot
     LogMessage -message ("Checking for TPM 2.0, UEFI Boot, Secure Boot") -Type 1 -Component 'Script'
@@ -1263,13 +1353,16 @@ Else {
         $failures += "Secure Boot not supported (likely Legacy BIOS mode)"
     }
 
-    # --- Final Evaluation ---
+    ### EXIT If We Failed Any Hard Checks! ####
     if ($failures.Count -ge 1) {
         Logmessage -message ("Device does NOT meet Windows 11 upgrade requirements:") -Type 3 -Component 'Compatibility'
         $failures | ForEach-Object { Write-Output " - $_" }
         try { Stop-Transcript } catch {}
         exit 1    
     }
+    ### END - Checking for the most basic requirements ####
+    
+    ### We Didn't Fail Any Hard Checks So We Will Continue The Upgrade Process! ####
     else {
         # Get system info
         $CSInfo = (Get-Computerinfo)
@@ -1280,7 +1373,7 @@ Else {
         $Type = $CSInfo.CsPCSystemType
         LogMessage -message ("We are working on a $($Manufacturer) $($Model) running $($OS) $($OSDisplayVersion). The system type is $($Type).") -Type 1 -Component 'ComputerInfo'
 
-        # Delete the fonts to resolve "We couldn't update the system reserved partition" error.
+        ### BEGIN -  Delete the fonts to resolve "We couldn't update the system reserved partition" error. ####
         $partitionStyle = Get-PartitionStyle
         LogMessage -message ("The partition type is $($partitionStyle).") -Type 1 -Component 'Get-PartitionStyle'
         switch ($partitionStyle) {
@@ -1297,154 +1390,188 @@ Else {
                 LogMessage -message  "Error: Unsupported partition style: $partitionStyle" -Type 3 -Component 'Get-PartitionStyle'
             }
         }
+        ### END -  Delete the fonts to resolve "We couldn't update the system reserved partition" error. ####
 
 
-        # Now let's work on WinRE
+        ### BEGIN - Working On WinRE ####
         # Get WinRE partition info
         $InitialWinREStatus = Get-WinREInfo
-        $WinREStatus = $InitialWinREStatus[0]
-        $WinRELocation = $InitialWinREStatus[1]
-        if ($WinREStatus) {
-            LogMessage -message ("WinRE Enabled") -Type 1 -Component 'Get-WinREInfo'  
 
-            # Get System directory and ReAgent xml file
-            $system32Path = [System.Environment]::SystemDirectory
-            LogMessage -message ("System directory: " + $system32Path) -Type 1 -Component 'Get-WinREInfo'
-            $ReAgentXmlPath = [System.Environment]::SystemDirectory + "\Recovery\ReAgent.xml"
-            LogMessage -message ("ReAgent xml: " + $ReAgentXmlPath) -Type 1 -Component 'Get-WinREInfo'
-            if (-Not (Test-Path $ReAgentXmlPath)) {
-                LogMessage -message ("Error: ReAgent.xml cannot be found") -Type 2 -Component 'Get-WinREInfo'
-                LogMessage -message ("ReAgent.xml not found. Creating a new one...") -Type 2 -Component 'Get-WinREInfo'
+        if ($InitialWinREStatus -and $InitialWinREStatus.Count -ge 1) {
+            $WinREStatus = $InitialWinREStatus[0]
 
-                # Create XML structure
-                $xml = New-Object System.Xml.XmlDocument
-                $declaration = $xml.CreateXmlDeclaration("1.0", "utf-8", $null)
-                $xml.AppendChild($declaration)
+            if ($WinREStatus.WinREStatus -eq 'Enabled') {
+                LogMessage -message "WinRE Enabled" -Type 1 -Component 'Get-WinREInfo' 
 
-                # Create root node
-                $root = $xml.CreateElement("WindowsRE")
-                $root.SetAttribute("version", "2.0")  # Ensuring structure consistency
-                $xml.AppendChild($root)
+                # Get system directory and ReAgent.xml path
+                $system32Path = [System.Environment]::SystemDirectory
+                LogMessage -message "System directory: $system32Path" -Type 1 -Component 'Get-WinREInfo'
+                $ReAgentXmlPath = "$system32Path\Recovery\ReAgent.xml"
+                LogMessage -message "ReAgent xml: $ReAgentXmlPath" -Type 1 -Component 'Get-WinREInfo'
 
-                # Create required nodes
-                $nodeNames = @("ImageLocation", "PBRImageLocation", "PBRCustomImageLocation", "DownlevelWinreLocation")
-    
-                foreach ($nodeName in $nodeNames) {
-                    $node = $xml.CreateElement($nodeName)
-                    $node.SetAttribute("path", "")
-                    $node.SetAttribute("offset", "0")
-                    $node.SetAttribute("guid", "{00000000-0000-0000-0000-000000000000}")
-                    $node.SetAttribute("id", "0")
-                    $root.AppendChild($node)
-                }
+                if (-not (Test-Path $ReAgentXmlPath)) {
+                    LogMessage -message "ReAgent.xml not found. Creating a new one..." -Type 2 -Component 'Get-WinREInfo'
 
-                # Save new XML file
-                $xml.Save($ReAgentXmlPath)
-                LogMessage -message ("Created and saved new ReAgent.xml at $ReAgentXmlPath.") -Type 1 -Component 'Get-WinREInfo'
-            }
-            else {
-                LogMessage -message ("ReAgent.xml found.") -Type 1 -Component 'Get-WinREInfo'
-                # We found the XML so let's read it just for fun. We might use this info one day, just not today. - PJM
-                LogMessage -Message 'We found the XML so let us read it just for fun. We might use this info one day, just not today. - PJM' -Type 1 -Component 'Get-WinREInfo'
-                $WinREDetails = Get-WinREInfo
-                $WinREDetails
-            }                      
-            LogMessage -message ("Done.") -Type 1 -Component 'Get-WinREInfo'
-   
-            # Get the RE version info since we are already getting other WinRE info.
-            # This is used for the updates not the resize.
-            $WindowsRELocation = $WinREStatus.ImagePath
-            $WindowsRELocationTrimmed = $WindowsRELocation.Trim()
-            $DismImageFileArg = "/ImageFile:$WindowsRELocationTrimmed"
-            LogMessage -message ("WinRELOcation: $WindowsRELocation")
-            LogMessage -message ("WinRELOcation: $WindowsRELocationTrimmed")
-            LogMessage -message ("WinRELOcation: $DismImageFileArg")   
-            
-            
-            
-            # Use Select-String to find the specific lines for Version, ServicePack Build, and ServicePack Level
-            $reVersion = ($output | Select-String -Pattern '^Version\s+:\s+').ToString().Split(":")[1].Trim()
-            $spBuild = ($output | Select-String -Pattern 'ServicePack Build').ToString().Split(":")[1].Trim()
-            $spLevel = ($output | Select-String -Pattern 'ServicePack Level').ToString().Split(":")[1].Trim()
-            # Output the extracted values
-            "Version: $reVersion"
-            "ServicePack Build: $spBuild"
-            "ServicePack Level: $spLevel"
-            # Extract the ServicePack Build and convert it to an integer
-            $spBuild = ($output | Select-String -Pattern 'ServicePack Build').ToString().Split(":")[1].Trim()
-            $spBuildInt = [int]$spBuild
-            "ServicePack Build (Integer): $spBuildInt"
-            $reVersionInt = [Version]$reVersion
+                    # Create minimal structure for ReAgent.xml
+                    $xml = New-Object System.Xml.XmlDocument
+                    $declaration = $xml.CreateXmlDeclaration("1.0", "utf-8", $null)
+                    $xml.AppendChild($declaration)
 
-            # Run the Microsoft function that checks and resizes the disk
-            # See this: https://support.microsoft.com/en-us/topic/kb5035679-instructions-to-run-a-script-to-resize-the-recovery-partition-to-install-a-winre-update-98502836-cb2c-4d9a-874c-23bcdf16cd45
-            LogMessage -message ("Running the Microsoft disk resize script.") -Type 1 -Component 'Resize-Disk'
-            Resize-Disk
+                    $root = $xml.CreateElement("WindowsRE")
+                    $root.SetAttribute("version", "2.0")
+                    $xml.AppendChild($root)
 
-            # Update WinRE if needed  
-            if ($OS -contains "Windows 10") {
-                if ($reVersionInt) {
-                    if ($reVersionInt -ge 10.0.19041.5025) {
-                        LogMessage -message ("WinRE version $($reVersion) is greater than or equal to 10.0.19041.5025. No update required.")
-                        Return
+                    $nodeNames = @("ImageLocation", "PBRImageLocation", "PBRCustomImageLocation", "DownlevelWinreLocation")
+                    foreach ($nodeName in $nodeNames) {
+                        $node = $xml.CreateElement($nodeName)
+                        $node.SetAttribute("path", "")
+                        $node.SetAttribute("offset", "0")
+                        $node.SetAttribute("guid", "{00000000-0000-0000-0000-000000000000}")
+                        $node.SetAttribute("id", "0")
+                        $root.AppendChild($node)
                     }
-                    else {
-                        if ($OSDisplayVersion -eq '22H2' ) {
-                            $Download = 'c:\downloadedupdate\WinREUpdate.cab'  
-                            $doUpdate = $True
-                            # Make the mount dir
-                            if (!(Test-Path 'c:\mount')) {
-                                md 'c:\mount'
-                            }
 
-                            # Make the download dir
-                            if (!(Test-Path 'c:\downloadedupdate')) {
-                                md 'c:\downloadedupdate'
-                            }
- 
-                            # Download the update
-                            Invoke-WebRequest 'https://catalog.s.download.windowsupdate.com/c/msdownload/update/software/crup/2024/10/windows10.0-kb5044615-x64_4b85450447ef0e6750ea0c0b576c6ba6605d2e4c.cab' -OutFile $Download
-                        }
-                    }
+                    $xml.Save($ReAgentXmlPath)
+                    LogMessage -message "Created and saved new ReAgent.xml at $ReAgentXmlPath." -Type 1 -Component 'Get-WinREInfo'
                 }
                 else {
-                    LogMessage -message ("Old version of Windows 10 needs to be updated. No action taken.")
-                    Return
+                    LogMessage -message "ReAgent.xml found." -Type 1 -Component 'Get-WinREInfo'
+                    LogMessage -message "We found the XML so let's read it just for fun. We might use this info one day, just not today. - PJM" -Type 1 -Component 'Get-WinREInfo'
+                    $WinREDetails = Get-WinREInfo
+                    $WinREDetails
                 }
-            }
- 
-            # We determined that we need to do an update. Now Let's check the partition space.
-            If ($doUpdate) {
-                LogMessage -message ("WinRE requires an update.")
 
-                # Make sure we have the update before we make any changes!
-                If (test-path 'c:\downloadedupdate\WinREUpdate.cab') {
-                    LogMessage -message ("We have an update to install.") 
+                LogMessage -message "Done." -Type 1 -Component 'Get-WinREInfo'
 
-                    # If we made it this far we will install the update
-                    # Update the image
-                    ReAgentC.exe /mountre /path c:\mount
-                    # Dism /Add-Package /Image:C:\mount\ /PackagePath:"c:\downloadedupdate\update.msu" or 
+                # Attempt to back up WinRE before doing anything risky
+                if (-not (Backup-WinRE)) {
+                    LogMessage -message "We don't have a backup so we will skip this risky operation." -Type 2 -Component 'Backup-WinRE'
+                    return
+                }
 
-                    Dism /Add-Package /Image:C:\mount\ /PackagePath:"c:\downloadedupdate\WinREUpdate.cab"
-                    Dism /image:C:\mount /cleanup-image /StartComponentCleanup /ResetBase
-                    ReAgentC.exe /unmountre /path c:\mount /commit
+                # Get RE version info for update decisions
+                $WindowsRELocation = $WinREStatus.ImagePath
+                $WindowsRELocationTrimmed = $WindowsRELocation.Trim()
+                $DismImageFileArg = "/ImageFile:$WindowsRELocationTrimmed"
 
-                    # If bitlocker is enabled:
-                    $Volumes = Get-BitLockerVolume
-                    if (($Volumes.MountPoint -eq 'C:') -and ($volumes.VolumeStatus -eq 'FullyEncrypted')) {
-                        LogMessage -message ('Bitlocker is enabled. Disable/Enable WinRE')
-                        Disable-WinRE
-                        Enable-WinRE      
+                LogMessage -message "WinRELocation: $WindowsRELocation"
+                LogMessage -message "WinRELocationTrimmed: $WindowsRELocationTrimmed"
+                LogMessage -message "DismImageFileArg: $DismImageFileArg"
+
+                try {
+                    $Output = Dism /Get-ImageInfo $DismImageFileArg /index:1 2>&1
+                    if (-not $Output -or $Output.Count -eq 0 -or ($Output -join "`n") -match "Error") {
+                        throw "DISM command failed or returned no output.`nOutput:`n$($Output -join "`n")"
+                    }
+
+                    $reVersion = ($Output | Select-String -Pattern '^Version\s+:\s+').ToString().Split(":")[1].Trim()
+                    $spBuild = ($Output | Select-String -Pattern 'ServicePack Build').ToString().Split(":")[1].Trim()
+                    $spLevel = ($Output | Select-String -Pattern 'ServicePack Level').ToString().Split(":")[1].Trim()
+
+                    LogMessage -message "Version: $reVersion"
+                    LogMessage -message "ServicePack Build: $spBuild"
+                    LogMessage -message "ServicePack Level: $spLevel"
+
+                    $spBuildInt = [int]$spBuild
+                    $reVersionInt = [Version]$reVersion
+                    LogMessage -message "ServicePack Build (Integer): $spBuildInt"
+                }
+                catch {
+                    LogMessage -message "DISM failed: $($_.Exception.Message)" -Type 2
+                    if (-not (Test-Path "$env:SystemRoot\System32\Recovery\WinRE.wim")) {
+                        if (Restore-WinRE) {
+                            LogMessage -message "WinRE.wim restored. You may retry the operation if needed." -Type 1
+                        }
+                        else {
+                            LogMessage -message "Restore failed. Skipping WinRE operations." -Type 2
+                        }
+                    }
+                    return
+                }
+
+                # Resize the partition if needed
+                LogMessage -message "Running the Microsoft disk resize script." -Type 1 -Component 'Resize-Disk'
+                try {
+                    Resize-Disk
+                }
+                catch {
+                    LogMessage -message "Resize-Disk failed: $($_.Exception.Message)" -Type 3 -Component 'Resize-Disk'
+                    return
+                }
+
+                # Determine whether WinRE update is required
+                if ($OS -contains "Windows 10") {
+                    if ($reVersionInt) {
+                        if ([version]$reVersionInt -ge [version]'10.0.19041.5025') {
+                            LogMessage -message "WinRE version $reVersion is greater than or equal to 10.0.19041.5025. No update required."
+                            return
+                        }
+                        elseif ($OSDisplayVersion -eq '22H2') {
+                            $Download = 'C:\downloadedupdate\WinREUpdate.cab'
+                            $doUpdate = $true
+
+                            if (!(Test-Path 'C:\mount')) { New-Item -Path 'C:\mount' -ItemType Directory | Out-Null }
+                            if (!(Test-Path 'C:\downloadedupdate')) { New-Item -Path 'C:\downloadedupdate' -ItemType Directory | Out-Null }
+
+                            if (!(Test-Path $Download)) {
+                                try {
+                                    Invoke-WebRequest 'https://catalog.s.download.windowsupdate.com/c/msdownload/update/software/crup/2024/10/windows10.0-kb5044615-x64_4b85450447ef0e6750ea0c0b576c6ba6605d2e4c.cab' -OutFile $Download
+                                }
+                                catch {
+                                    LogMessage -message "Failed to download WinRE update: $($_.Exception.Message)" -Type 3
+                                    return
+                                }
+                            }
+                        }
+                    }
+                    else {
+                        LogMessage -message "Old version of Windows 10 needs to be updated. No action taken."
+                        return
                     }
                 }
-            }
 
+                # Perform update if necessary
+                if ($doUpdate) {
+                    LogMessage -message "WinRE requires an update."
+
+                    if (Test-Path $Download) {
+                        LogMessage -message "We have an update to install."
+
+                        ReAgentC.exe /mountre /path C:\mount
+                        Dism /Add-Package /Image:C:\mount\ /PackagePath:$Download
+                        Dism /Image:C:\mount /Cleanup-Image /StartComponentCleanup /ResetBase
+                        ReAgentC.exe /unmountre /path C:\mount /commit
+
+                        try {
+                            if (-not (Test-Path "$env:SystemRoot\System32\Recovery\WinRE.wim")) {
+                                if (-not (Restore-WinRE)) {
+                                    LogMessage -message "Restore failed. Cannot re-enable WinRE." -Type 3
+                                    return
+                                }
+                            }
+                            LogMessage -message 'Re-registering WinRE after update (Disable/Enable).'
+                            Disable-WinRE
+                            Enable-WinRE
+                        }
+                        catch {
+                            LogMessage -message "Enable-WinRE failed: $($_.Exception.Message)" -Type 2
+                        }
+                    }
+                    else {
+                        LogMessage -message "Expected update file not found: $Download" -Type 3
+                    }
+                }                
+            }
+            else {
+                LogMessage -message "WinREStatus object is null or invalid. Skipping WinRE operations." -Type 2 -Component 'Get-WinREInfo'               
+            }
         }
         else {
-            LogMessage -message ('WARNING: Unable to get WinRE status. Skip working on WinRE!') -Type 3 
+            LogMessage -message "Get-WinREInfo returned null or empty. Skipping WinRE operations." -Type 2 -Component 'Get-WinREInfo'         
         }
-    
+        ### END - Working On WinRE ####
+        
+
         ### BEGIN - Cleanup unsigned Microsoft print drivers ####
         LogMessage -message ('BEGIN - Cleanup unsigned Microsoft print drivers') -Component 'Clean-Drivers'
         Clean-Drivers
@@ -1506,26 +1633,26 @@ Else {
 
         # If any key is not good delete them all and run the appraiser
         if ($UpgExArray -contains 'Red' -or $GStatusArray -eq $null -or $GStatusArray.Count -eq 0 -or $GStatusArray -notcontains '2' -or ($GStatusArray -contains '2' -and $GStatusArray -ne '2')) {
-            $Red = $true
+            $Red = $true # Added to track removals but not implemented yet - PJM
             $RedValues = @() # Added to track removals but not implemented yet - PJM
             $RedPaths = Get-ChildItem -Recurse $RegistryPathAppCompat | Get-KeyPath | Where-Object Name -eq $RegValueRedReason | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
 
             # Delete all the redreasons
             foreach ($Path in $RedPaths) {
-                LogMessage -message ('Found red reasons. Delete them!') -Component 'Appraiser'
+                LogMessage -message ("Found red path: $($Path) Delete it!") -Component 'Appraiser'
                 Remove-Item -Path $Path -ErrorAction SilentlyContinue
             }
 
             # Delete other indicators:
             $Markers = Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\CompatMarkers\' | Select-Object -ExpandProperty Name 
             foreach ($Marker in $Markers) {
-                LogMessage -message ('Found markers. Delete them!') -Component 'Appraiser'
-                Remove-Item -Path "Registry::$Marker" -ErrorAction SilentlyContinue
+                LogMessage -message ("Found marker: $($Marker). Delete it!") -Component 'Appraiser'
+                Remove-Item -Path "Registry:$Marker" -ErrorAction SilentlyContinue
             }
 
             $Caches = Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Appraiser\WuCache\' | Select-Object -ExpandProperty Name 
             foreach ($Cache in $Caches) {
-                LogMessage -message ('Found caches. Delete them!') -Component 'Appraiser'
+                LogMessage -message ("Found cache: $($Cache). Delete it!") -Component 'Appraiser'
                 Remove-Item -Path "Registry::$Cache" -ErrorAction SilentlyContinue
             }
 
