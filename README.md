@@ -81,10 +81,7 @@ powershell.exe -noprofile -executionpolicy bypass -file Upgrade_Windows_with_Fix
 | 20.0    | April 30, 2025 | Added support for putting ServiceUI.exe in the Win32 app package.
 | 21.0    | May 1, 2025 | Removed the attempt(s) to detect sucess/failure of the upgrade.  
 | 22.0    | May 2, 2025 | Added preserve language support, better logging, more safety around WinRE operations.
-
-
-
-
+| 25.0    | May 6, 2025 | Scheduled task for post upgrade cleanup, better detection for upgrade completion, resolved serviceui.exe path bug
 
 ---
 

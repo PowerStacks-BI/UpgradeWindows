@@ -117,6 +117,11 @@ Contact: https://x.com/MEM_MVP
 - Log function now attempts to log line number of errors. 
 - Stole, and implemented, some code from Gary to improve https://garytown.com/low-space-on-efi-system-partition-clean-up cleanp of the system reserved partition
 
+25 - May 6, 2025
+- Scheduled task creation error resolved
+- Changed from waiting for specified number of minutes to reading the setupact.log to watch for 100%
+- Resolved bug in serviceui.exe path
+
 .EXAMPLE
 To execute the script manually:
 
@@ -237,6 +242,12 @@ $elapsedSeconds = 0
 # ------------------------------------
 # End Defining Script Variables
 # ------------------------------------
+
+# Create the working directory if it doesn't exist
+if (-not (Test-Path $Win11WorkingDirectory)) {
+    mkdir $Win11WorkingDirectory
+}
+ 
 
 # Make sure that we are not already in Windows 11
 $isWin11 = (Get-WmiObject Win32_OperatingSystem).Caption -Match "Windows 11"
@@ -732,6 +743,13 @@ Else {
 
         try {
             $WinreInfo = reagentc /info
+            $WinreInfoLines = $WinreInfo -split "`r?`n"
+
+            foreach ($line in $WinreInfoLines) {
+                if (-not [string]::IsNullOrWhiteSpace($line)) {
+                    LogMessage -message $line
+                }
+            }
             $RecoveryPartitionStatus = $WinreInfo.split("`n")[3].split(' ')[-1]
 
             if ($RecoveryPartitionStatus -eq 'Enabled') {
@@ -1260,7 +1278,28 @@ Else {
         }
 
         LogMessage -message ("Resize operation complete.") -Component 'Resize-Disk'
-    }    
+    }  
+        
+    function Get-LastLines {
+        param (
+            [string]$Path,
+            [int]$LineCount = 1000
+        )
+
+        $lines = New-Object System.Collections.Generic.List[string]
+        $reader = [System.IO.File]::OpenText($Path)
+        while (-not $reader.EndOfStream) {
+            $line = $reader.ReadLine()
+            $lines.Add($line)
+            if ($lines.Count -gt $LineCount) {
+                $lines.RemoveAt(0)
+            }
+        }
+        $reader.Close()
+        return $lines
+    }
+
+
     # ------------------------------------
     # End Functions
     # ------------------------------------
@@ -1606,51 +1645,76 @@ Else {
         }
         ### END - Run the disk cleanup wizard ####
     
-        ### BEGIN - Detecting Red reasons, clear them, re-run appraiser  ###
+        ### BEGIN - Appraiser  ###
         LogMessage -message ('Detecting Red reasons, clear them, re-run appraiser')
 
+        # --- Get and evaluate GStatus ---
         LogMessage -message ('Getting G Status Paths')
-        $GStatusPaths = Get-ChildItem -Recurse $RegistryPathAppCompat | Get-KeyPath | Where-Object Name -eq $RegValueGStatus | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
-        if ($GStatusPaths) {
-            LogMessage -message ('Found G Status Paths') -Component 'Appraiser'
-            $GStatusArray = New-Object System.Collections.ArrayList
-            foreach ($Path in $GStatusPaths) {
-                LogMessage -message ("Checking path: $Path") -Component 'Appraiser'
-                $GStatusArray.Add((Get-ItemPropertyValue -Path $Path -Name $RegValueGStatus))        
-            }
+        $GStatusArray = New-Object System.Collections.ArrayList
+        $GStatusPaths = Get-ChildItem -Recurse $RegistryPathAppCompat |
+            Get-KeyPath |
+            Where-Object Name -eq $RegValueGStatus |
+            Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+
+        foreach ($Path in $GStatusPaths) {
+            LogMessage -message ("Checking path: $Path") -Component 'Appraiser'
+            $value = Get-ItemPropertyValue -Path $Path -Name $RegValueGStatus -ErrorAction SilentlyContinue
+            if ($null -ne $value) { [void]$GStatusArray.Add($value.ToString()) }
         }
 
+        # --- Get and evaluate UpgEx ---
         LogMessage -message ('Getting Upg Ex Paths') -Component 'Appraiser' 
-        $UpgExPaths = Get-ChildItem -Recurse $RegistryPathAppCompat | Get-KeyPath | Where-Object Name -eq $RegValueUpgEx | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
-        if ($UpgExPaths) {
-            LogMessage -message ('Found Upg Ex Paths') -Component 'Appraiser'
-            $UpgExArray = New-Object System.Collections.ArrayList
-            foreach ($Path in $UpgExPaths) {
-                LogMessage -message ("Checking path: $Path") -Component 'Appraiser'
-                $UpgExArray.Add((Get-ItemPropertyValue -Path $Path -Name $RegValueUpgEx))  
-            }
+        $UpgExArray = New-Object System.Collections.ArrayList
+        $UpgExPaths = Get-ChildItem -Recurse $RegistryPathAppCompat |
+            Get-KeyPath |
+            Where-Object Name -eq $RegValueUpgEx |
+            Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+
+        foreach ($Path in $UpgExPaths) {
+            LogMessage -message ("Checking path: $Path") -Component 'Appraiser'
+            $value = Get-ItemPropertyValue -Path $Path -Name $RegValueUpgEx -ErrorAction SilentlyContinue
+            if ($null -ne $value) { [void]$UpgExArray.Add($value) }
         }
 
-        # If any key is not good delete them all and run the appraiser
-        if ($UpgExArray -contains 'Red' -or $GStatusArray -eq $null -or $GStatusArray.Count -eq 0 -or $GStatusArray -notcontains '2' -or ($GStatusArray -contains '2' -and $GStatusArray -ne '2')) {
-            $Red = $true # Added to track removals but not implemented yet - PJM
-            $RedValues = @() # Added to track removals but not implemented yet - PJM
-            $RedPaths = Get-ChildItem -Recurse $RegistryPathAppCompat | Get-KeyPath | Where-Object Name -eq $RegValueRedReason | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+        # --- Log collected values ---
+        LogMessage -message ("Collected GStatus values: $($GStatusArray -join ', ')") -Component 'Appraiser'
+        LogMessage -message ("Collected UpgEx values: $($UpgExArray -join ', ')") -Component 'Appraiser'
 
-            # Delete all the redreasons
+        # --- Determine upgrade blocker state ---
+        $hasBlockers = $false
+        if ($GStatusArray | Where-Object { $_ -ne '2' }) {
+            LogMessage -message "GStatus indicates safeguard hold (not all values are '2')" -Component 'Appraiser'
+            $hasBlockers = $true
+        }
+        if ($UpgExArray | Where-Object { $_ -eq 'Red' }) {
+            LogMessage -message "UpgEx indicates ineligibility (found 'Red')" -Component 'Appraiser'
+            $hasBlockers = $true
+        }
+
+        if ($hasBlockers) {
+            LogMessage -message "Blockers found. Running the appraiser." -Component 'Appraiser'
+
+            $Red = $true
+            $RedValues = @()
+            $RedPaths = Get-ChildItem -Recurse $RegistryPathAppCompat |
+                Get-KeyPath |
+                Where-Object Name -eq $RegValueRedReason |
+                Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+
             foreach ($Path in $RedPaths) {
                 LogMessage -message ("Found red path: $($Path) Delete it!") -Component 'Appraiser'
                 Remove-Item -Path $Path -ErrorAction SilentlyContinue
             }
 
-            # Delete other indicators:
-            $Markers = Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\CompatMarkers\' | Select-Object -ExpandProperty Name 
+            $Markers = Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\CompatMarkers\' |
+                Select-Object -ExpandProperty Name 
             foreach ($Marker in $Markers) {
                 LogMessage -message ("Found marker: $($Marker). Delete it!") -Component 'Appraiser'
                 Remove-Item -Path "Registry:$Marker" -ErrorAction SilentlyContinue
             }
 
-            $Caches = Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Appraiser\WuCache\' | Select-Object -ExpandProperty Name 
+            $Caches = Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Appraiser\WuCache\' |
+                Select-Object -ExpandProperty Name 
             foreach ($Cache in $Caches) {
                 LogMessage -message ("Found cache: $($Cache). Delete it!") -Component 'Appraiser'
                 Remove-Item -Path "Registry::$Cache" -ErrorAction SilentlyContinue
@@ -1659,8 +1723,7 @@ Else {
             LogMessage -message ("Appraiser path: $CompatAppraiserPath") -Component 'Appraiser'
             if (Test-Path $CompatAppraiserPath) {
                 LogMessage -message ('Running compatibility appraisers...') -Component 'Appraiser'
-                
-                # Force the compatibility appraiser to run:
+
                 Start-Process -FilePath $CompatAppraiserPath -ArgumentList '-m:appraiser.dll -f:DoScheduledTelemetryRun' -WindowStyle Hidden -Wait -PassThru
                 Start-Process -FilePath $CompatAppraiserPath -ArgumentList '-m:appraiser.dll -f:UpdateAvStatus' -WindowStyle Hidden -Wait -PassThru
                 Start-Process -FilePath $CompatAppraiserPath -ArgumentList '-m:devinv.dll -f:CreateDeviceInventory' -WindowStyle Hidden -Wait -PassThru
@@ -1668,38 +1731,60 @@ Else {
                 Start-Process -FilePath $CompatAppraiserPath -ArgumentList '-m:invagent.dll -f:RunUpdate' -WindowStyle Hidden -Wait -PassThru
                 Start-Process -FilePath $CompatAppraiserPath -ArgumentList '-m:aemarebackup.dll -f:BackupMareData' -WindowStyle Hidden -Wait -PassThru
 
-                # Retest for bad things:
+                # --- Retest for blockers ---
                 LogMessage -message ('Retest for upgrade blockers') -Component 'Appraiser'
-                $GStatusPaths = Get-ChildItem -Recurse $RegistryPathAppCompat | Get-KeyPath | Where-Object Name -eq $RegValueGStatus | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
-                if ($GStatusPaths) {
-                    $GStatusArray = New-Object System.Collections.ArrayList
-                    foreach ($Path in $GStatusPaths) {
-                        $GStatusArray.Add((Get-ItemPropertyValue -Path $Path -Name $RegValueGStatus))        
-                    }
+                $GStatusArray = New-Object System.Collections.ArrayList
+                $GStatusPaths = Get-ChildItem -Recurse $RegistryPathAppCompat |
+                    Get-KeyPath |
+                    Where-Object Name -eq $RegValueGStatus |
+                    Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+
+                foreach ($Path in $GStatusPaths) {
+                    LogMessage -message ("Found new GStatus entry: $($Path)") -Component 'Appraiser'
+                    $value = Get-ItemPropertyValue -Path $Path -Name $RegValueGStatus -ErrorAction SilentlyContinue
+                    if ($null -ne $value) { [void]$GStatusArray.Add($value.ToString()) }
                 }
 
-                $UpgExPaths = Get-ChildItem -Recurse $RegistryPathAppCompat | Get-KeyPath | Where-Object Name -eq $RegValueUpgEx | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
-                if ($UpgExPaths) {
-                    $UpgExArray = New-Object System.Collections.ArrayList
-                    foreach ($Path in $UpgExPaths) {
-                        $UpgExArray.Add((Get-ItemPropertyValue -Path $Path -Name $RegValueUpgEx))      
-                    }
+                $UpgExArray = New-Object System.Collections.ArrayList
+                $UpgExPaths = Get-ChildItem -Recurse $RegistryPathAppCompat |
+                    Get-KeyPath |
+                    Where-Object Name -eq $RegValueUpgEx |
+                    Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+
+                foreach ($Path in $UpgExPaths) {
+                    LogMessage -message ("Found new UpgEx entry: $($Path)") -Component 'Appraiser'
+                    $value = Get-ItemPropertyValue -Path $Path -Name $RegValueUpgEx -ErrorAction SilentlyContinue
+                    if ($null -ne $value) { [void]$UpgExArray.Add($value) }
                 }
 
-                if ($UpgExArray -contains 'Red' -or $GStatusArray -eq $null -or $GStatusArray.Count -eq 0 -or $GStatusArray -notcontains '2' -or ($GStatusArray -contains '2' -and $GStatusArray -ne '2')) {
-                    LogMessage -message ('ERROR: Found new upgrade blockers!') -Component 'Appraiser'               
+                $hasBlockers = $false
+                if ($GStatusArray | Where-Object { $_ -ne '2' }) {
+                    LogMessage -message "GStatus still indicates safeguard hold." -Component 'Appraiser'
+                    $hasBlockers = $true
+                }
+                if ($UpgExArray | Where-Object { $_ -ne 'Green' }) {
+                    LogMessage -message "UpgEx still indicates ineligibility." -Component 'Appraiser'
+                    $hasBlockers = $true
+                }
+
+                if ($hasBlockers) {
+                    LogMessage -message 'ERROR: Found new upgrade blockers!' -Component 'Appraiser' -Type 3
                 }
                 else {
-                    LogMessage -message ('Resolved') -Component 'Appraiser'
+                    LogMessage -message 'Resolved' -Component 'Appraiser'
                 }
             }
             else {
-                LogMessage -message ("ERROR: Appraiser not found at path: $CompatAppraiserPath") -Component 'Appraiser'
+                LogMessage -message ("ERROR: Appraiser not found at path: $CompatAppraiserPath") -Component 'Appraiser' -Type 3
             }
+        }
+        else {
+            LogMessage -message "No blockers found. Skip running the appraiser." -Component 'Appraiser'
+        }
+        LogMessage -message ('END - Detecting Red reasons, clear them, re-run appraiser') -Component 'Appraiser'
+        ### END - Appraiser  ###
 
-            LogMessage -message ('END - Detecting Red reasons, clear them, re-run appraiser') -Component 'Appraiser'
-            ### END - Detecting Red reasons, clear them, re-run appraiser  ###
-        }  
+ 
 
         ### Begin - Windows 11 Upgrade ####
         LogMessage -message ("Starting the Windows 11 Upgrade") -Component 'Script'
@@ -1742,11 +1827,7 @@ Else {
             LogMessage -message ("It is safe to start windows10upgraderapp.exe.") -Component 'Upgrade'
         }                 
     
-        # Create the directory if it doesn't exist
-        if (-not (Test-Path $Win11WorkingDirectory)) {
-            mkdir $Win11WorkingDirectory
-        }
- 
+
         # ========================================
         # Initialize WebClient
         # ========================================
@@ -1772,9 +1853,10 @@ Else {
 
             if ($ServiceUIPath -like 'https://*') {
                 try {
-                    LogMessage -message ("Downloading ServiceUI.exe from $ServiceUIPath...") -Component 'Script'
+                    LogMessage -message ("Downloading ServiceUI.exe from $ServiceUIPath ...") -Component 'Script'
                     $webClient.DownloadFile($ServiceUIPath, $ServiceUIDestination)
                     LogMessage -message ("Successfully downloaded ServiceUI.exe.") -Component 'Script'
+                    LogMessage -message ("ServiceUI.exe saved to $ServiceUIDestination ...") -Component 'Script'
                 }
                 catch {
                     LogMessage -message ("Failed to download ServiceUI.exe. Error: $_") -Type 3 -Component 'Script'
@@ -1820,7 +1902,7 @@ Else {
             }
         }
         else {
-            LogMessage -message ("Found previously downloaded Windows 11 Installation Assistant.") -Component 'Script'
+            LogMessage -message ("Found previously downloaded Windows 11 Installation Assistant in $Windows11InstallationAssistantPath ....") -Component 'Script'
         } 
 
         # Prestage regkeys for the disk cleanup wizard to run after first login to Windows 11
@@ -1832,7 +1914,7 @@ Else {
     
         # Create scheduled task to reclaim disk space at first login.
         $taskName = "OneTimeCleanMgrAfterWin11Upgrade"
-        $scriptPath = "C:\Windows\Temp\$taskName.ps1"
+        $scriptPath = "$($Win11WorkingDirectory)\$taskName.ps1"
 
         # Build the actual script content separately (easy to indent and maintain)
         $taskScript = @"
@@ -1843,34 +1925,90 @@ Unregister-ScheduledTask -TaskName '$taskName' -Confirm:\$false
         # Write it to disk
         Set-Content -Path $scriptPath -Value $taskScript -Encoding UTF8
 
+        # Define the task settings
         $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`""
-        $trigger = New-ScheduledTaskTrigger -AtLogOn
-        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERNAME" -LogonType Interactive -RunLevel Limited
+        $trigger = New-ScheduledTaskTrigger -AtLogon
+        $trigger.ExecutionTimeLimit = "PT1H" 
+        $principal = New-ScheduledTaskPrincipal -UserID "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Priority 1
+        $settings.MultipleInstances = 'IgnoreNew'
+        $settings.WakeToRun = $true
+        $settings.Enabled = $true
 
         # Register the task
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+
+        # Enable task history
+        schtasks /Change /TN "$TaskName" /ENABLE
 
 
         #  Start Windows 11 Installation Assistant with or without ServiceUI        
         try {
-            if ($loggedOnUsers.Count -gt 0 -and (Test-Path $serviceUIPath)) {
+            if ($loggedOnUsers.Count -gt 0 -and (Test-Path $ServiceUIDestination)) {
+                LogMessage -message ("ServiceUI.exe found at: $ServiceUIDestination")
                 # Logged-on users detected and ServiceUI exists
                 LogMessage -message ("Starting Windows11InstallationAssistant.exe through ServiceUI.exe (visible to user)...") -Component 'Upgrade'
-                $proc = Start-Process -FilePath $serviceUIPath -ArgumentList "-process:explorer.exe `"$Windows11InstallationAssistantPath`" $upgradeArgs" -PassThru                
+                $proc = Start-Process -FilePath $ServiceUIDestination -ArgumentList "-process:explorer.exe `"$Windows11InstallationAssistantPath`" $upgradeArgs" -PassThru                
             }
             else {
+                LogMessage -message ("ServiceUI.exe not found at: $ServiceUIDestination")
                 # No users detected or ServiceUI missing - run directly
                 LogMessage -message ("Starting Windows11InstallationAssistant.exe directly (Failed to detect logged on user or path to serviceui.exe)...") -Component 'Upgrade'
                 $proc = Start-Process -FilePath $Windows11InstallationAssistantPath -ArgumentList $upgradeArgs -PassThru               
             }
             LogMessage -message ("Started Windows11InstallationAssistant.exe with process id $($proc.Id).") -Component 'Upgrade'
-            SleepNow -Length $sleepTime
+            
+            # SleepNow -Length $sleepTime <<<----- Version 24 replaces the static sleep timer with yet another attempt to monitor the upgrade.
+            
+            # Read the setupact.log waiting for 100%
+            $setupactLogPath = 'C:\$WINDOWS.~BT\Sources\Panther\setupact.log'
+            $checkLogIntervalSeconds = 60
+            $iteration = 0
+            $maxDuration = New-TimeSpan -Hours 2
+            $startTime = Get-Date
+
+            LogMessage -message ("Started waiting at  $startTime")
+            LogMessage -message ("Will wait for $maxDuration")
+
+            while (-not (Test-Path $setupactLogPath)) {
+                LogMessage -message ("Waiting for $setupactLogPath to appear...") -Type 1 -Component 'Upgrade'
+                Start-Sleep -Seconds 60
+            }
+
+            LogMessage -message ("Found the setupact.log")
+            LogMessage -message ("Monitoring for 'Overall progress: [100%]'...") -Type 1 -Component 'Upgrade'
+
+            while ($true) {
+                if ((Get-Date) - $startTime -gt $maxDuration) {
+                    LogMessage -message ("Timeout reached. '100%' line not found. Exiting.")
+                    try { Stop-Transcript } catch {}
+                    exit 1
+                }
+                try {
+                    $lines = Get-LastLines -Path $setupactLogPath -LineCount 1000
+                    if ($lines -match "Overall progress: \[100%\]") {
+                        LogMessage -message ("Found 100% progress.") -Type 1 -Component 'Upgrade'
+                        break
+                    }
+                    else {
+                        $iteration++
+                        if ($iteration % 3 -eq 0) {
+                            LogMessage -message ("Still checking... not 100% yet.") -Type 1 -Component 'Upgrade'
+                        }
+                    }
+                }
+                catch {
+                    LogMessage -message ("Error reading file: $_" ) -Type 3 -Component 'Upgrade'
+                }
+
+                Start-Sleep -Seconds $checkLogIntervalSeconds
+            }         
         }
         catch {
             LogMessage -message ("Failed to start Windows11InstallationAssistant.exe. Error: $_") -Type 3 -Component 'Upgrade'
             try { Stop-Transcript } catch {}
             throw "Failed to start upgrade process."
-        }     
+        }    
         
     }
 }
