@@ -122,6 +122,11 @@ Contact: https://x.com/MEM_MVP
 - Changed from waiting for specified number of minutes to reading the setupact.log to watch for 100%
 - Resolved bug in serviceui.exe path
 
+26 - May 6, 2025
+- Resolved bug preventing Bitlocker from re-enabling.
+- Unregister exsisting cleanup task if it exsists.
+- Updated the Get-LastLines function to read locked files.
+
 .EXAMPLE
 To execute the script manually:
 
@@ -178,7 +183,7 @@ if ("$env:PROCESSOR_ARCHITEW6432" -ne "ARM64") {
 # ------------------------------------
 # Script Version Info
 # ------------------------------------
-[int]$ScriptVersion = 22
+[int]$ScriptVersion = 26
 
 
 # ========================================
@@ -235,7 +240,7 @@ $elapsedSeconds = 0
 
 
 # ========================================
-# Variables: Default time (min) to sleep when caling sleepNow
+# Variables: Default time (min) to sleep when calling sleepNow function
 # ========================================
 [int]$sleepTime = 30
 
@@ -1271,8 +1276,9 @@ Else {
             }
         }
 
-        # Call the function to re-enable Bitlocker
-        if ($bitlocker -and $bitlocker.ProtectionStatus -eq 'On') {
+        # Re-enable Bitlocker
+        $bitlocker = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
+        if ($bitlocker.ProtectionStatus -eq 'Off' -and $bitlocker.VolumeStatus -eq 'FullyEncrypted') {
             LogMessage -message ("Resuming BitLocker protection.") -Component 'Resize-Disk'
             Resume-BitLocker -MountPoint $env:SystemDrive
         }
@@ -1280,25 +1286,162 @@ Else {
         LogMessage -message ("Resize operation complete.") -Component 'Resize-Disk'
     }  
         
+
     function Get-LastLines {
+
+        <#
+            .SYNOPSIS
+            Reads the last N lines of a text file, even if it is locked by another process.
+
+            .DESCRIPTION
+            The Get-LastLines function reads the final N lines of a specified file, including log files that are actively in use or locked for writing.
+            It uses low-level Win32 API calls to safely access locked files with read and write sharing permissions, emulating behavior similar to CMTrace.
+            If the current PowerShell version does not support this access method, it falls back to a standard .NET stream reader.
+
+            The function also supports optional live tailing using the -Follow switch, continuously monitoring the file for new lines.
+            A timeout value can be specified with -Timeout to limit how long the function will monitor the file.
+
+            Lines are returned through the -ProcessLine script block, which is executed for each line found.
+
+            .EXAMPLE
+            Get-LastLines -Path "C:\Logs\setupact.log" -LineCount 1000 -ProcessLine {
+                if ($_ -match "Overall progress: \[100%\]") {
+                    Write-Host "Upgrade reached 100%"
+                }
+            }
+
+            .EXAMPLE
+            Get-LastLines -Path "C:\Logs\setupact.log" -LineCount 500 -Follow -Timeout (New-TimeSpan -Minutes 30) -ProcessLine {
+                if ($_ -match "ERROR") {
+                    Write-Host "Error found: $_"
+                }
+            }
+        #>
+        param(
+            [Parameter(Mandatory)]
+            [string]$Path,
+
+            [int]$LineCount = 1000,
+
+            [ScriptBlock]$ProcessLine = {
+                param($line)
+                Write-Host $line
+            },
+
+            [switch]$Follow,
+
+            [TimeSpan]$Timeout
+        )
+
+        $psMajorVersion = $PSVersionTable.PSVersion.Major
+        if ($psMajorVersion -lt 5) {
+            Write-Warning "PowerShell version too old for low-level file access. Using fallback method."
+            return ($null -ne (Fallback-LastLines -Path $Path -LineCount $LineCount | Where-Object { & $ProcessLine $_ }))
+        }
+
+        try {
+            Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public class FileAccessHelper {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    public static extern SafeFileHandle CreateFile(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    public static FileStream OpenFile(string path) {
+        const uint GENERIC_READ = 0x80000000;
+        const uint FILE_SHARE_READ = 0x00000001;
+        const uint FILE_SHARE_WRITE = 0x00000002;
+        const uint OPEN_EXISTING = 3;
+
+        SafeFileHandle handle = CreateFile(path, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+
+        if (handle.IsInvalid) {
+            throw new IOException("Unable to open file", Marshal.GetLastWin32Error());
+        }
+
+        return new FileStream(handle, FileAccess.Read);
+    }
+}
+"@ -ErrorAction Stop
+
+            $stream = [FileAccessHelper]::OpenFile($Path)
+            $reader = New-Object System.IO.StreamReader($stream)
+
+            try {
+                $lines = New-Object System.Collections.Generic.List[string]
+
+                while (-not $reader.EndOfStream) {
+                    $line = $reader.ReadLine()
+                    $lines.Add($line)
+                    if ($lines.Count -gt $LineCount) {
+                        $lines.RemoveAt(0)
+                    }
+                }
+
+                foreach ($line in $lines) {
+                    if (& $ProcessLine $line) { return $true }
+                }
+
+                if ($Follow) {
+                    $startTime = Get-Date
+                    while ($true) {
+                        Start-Sleep -Milliseconds 500
+                        while (-not $reader.EndOfStream) {
+                            $line = $reader.ReadLine()
+                            if (& $ProcessLine $line) { return $true }
+                        }
+                        if ($Timeout -and ((Get-Date) - $startTime -gt $Timeout)) {
+                            break
+                        }
+                    }
+                }
+                return $false
+            }
+            finally {
+                $reader.Close()
+            }
+        }
+        catch {
+            Write-Warning "Failed to read from locked file using advanced method. Falling back."
+            return ($null -ne (Fallback-LastLines -Path $Path -LineCount $LineCount | Where-Object { & $ProcessLine $_ }))
+        }
+    }
+
+    function Fallback-LastLines {
         param (
             [string]$Path,
             [int]$LineCount = 1000
         )
 
         $lines = New-Object System.Collections.Generic.List[string]
-        $reader = [System.IO.File]::OpenText($Path)
-        while (-not $reader.EndOfStream) {
-            $line = $reader.ReadLine()
-            $lines.Add($line)
-            if ($lines.Count -gt $LineCount) {
-                $lines.RemoveAt(0)
+        try {
+            $reader = [System.IO.File]::OpenText($Path)
+            while (-not $reader.EndOfStream) {
+                $line = $reader.ReadLine()
+                $lines.Add($line)
+                if ($lines.Count -gt $LineCount) {
+                    $lines.RemoveAt(0)
+                }
             }
+            $reader.Close()
         }
-        $reader.Close()
+        catch {
+            Write-Warning "Fallback method also failed: $_"
+        }
         return $lines
     }
-
 
     # ------------------------------------
     # End Functions
@@ -1916,6 +2059,12 @@ Else {
         $taskName = "OneTimeCleanMgrAfterWin11Upgrade"
         $scriptPath = "$($Win11WorkingDirectory)\$taskName.ps1"
 
+        # Check for, and remove, exsisting scheduled task
+        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($task) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+        }
+
         # Build the actual script content separately (easy to indent and maintain)
         $taskScript = @"
 Start-Process CleanMgr.exe -ArgumentList '/sagerun:1234' -WindowStyle Hidden -Wait
@@ -1946,71 +2095,60 @@ Unregister-ScheduledTask -TaskName '$taskName' -Confirm:\$false
         try {
             if ($loggedOnUsers.Count -gt 0 -and (Test-Path $ServiceUIDestination)) {
                 LogMessage -message ("ServiceUI.exe found at: $ServiceUIDestination")
-                # Logged-on users detected and ServiceUI exists
                 LogMessage -message ("Starting Windows11InstallationAssistant.exe through ServiceUI.exe (visible to user)...") -Component 'Upgrade'
-                $proc = Start-Process -FilePath $ServiceUIDestination -ArgumentList "-process:explorer.exe `"$Windows11InstallationAssistantPath`" $upgradeArgs" -PassThru                
+                $proc = Start-Process -FilePath $ServiceUIDestination -ArgumentList "-process:explorer.exe `"$Windows11InstallationAssistantPath`" $upgradeArgs" -PassThru
             }
             else {
                 LogMessage -message ("ServiceUI.exe not found at: $ServiceUIDestination")
-                # No users detected or ServiceUI missing - run directly
                 LogMessage -message ("Starting Windows11InstallationAssistant.exe directly (Failed to detect logged on user or path to serviceui.exe)...") -Component 'Upgrade'
-                $proc = Start-Process -FilePath $Windows11InstallationAssistantPath -ArgumentList $upgradeArgs -PassThru               
+                $proc = Start-Process -FilePath $Windows11InstallationAssistantPath -ArgumentList $upgradeArgs -PassThru
             }
+
             LogMessage -message ("Started Windows11InstallationAssistant.exe with process id $($proc.Id).") -Component 'Upgrade'
-            
-            # SleepNow -Length $sleepTime <<<----- Version 24 replaces the static sleep timer with yet another attempt to monitor the upgrade.
-            
-            # Read the setupact.log waiting for 100%
+
+            # Wait for setupact.log to appear
             $setupactLogPath = 'C:\$WINDOWS.~BT\Sources\Panther\setupact.log'
-            $checkLogIntervalSeconds = 60
-            $iteration = 0
             $maxDuration = New-TimeSpan -Hours 2
             $startTime = Get-Date
 
-            LogMessage -message ("Started waiting at  $startTime")
+            LogMessage -message ("Started monitoring the upgrade process at $startTime")
             LogMessage -message ("Will wait for $maxDuration")
 
             while (-not (Test-Path $setupactLogPath)) {
                 LogMessage -message ("Waiting for $setupactLogPath to appear...") -Type 1 -Component 'Upgrade'
-                Start-Sleep -Seconds 60
+                Start-Sleep -Seconds 30
+                if ((Get-Date) - $startTime -gt $maxDuration) {
+                    throw "Timeout waiting for setupact.log to appear."
+                }
             }
 
             LogMessage -message ("Found the setupact.log")
             LogMessage -message ("Monitoring for 'Overall progress: [100%]'...") -Type 1 -Component 'Upgrade'
 
-            while ($true) {
-                if ((Get-Date) - $startTime -gt $maxDuration) {
-                    LogMessage -message ("Timeout reached. '100%' line not found. Exiting.")
-                    try { Stop-Transcript } catch {}
-                    exit 1
+            $result = Get-LastLines -Path $setupactLogPath -LineCount 1000 -Follow -Timeout $maxDuration -ProcessLine {
+                param($line)
+                if ($line -match "Overall progress: \[100%\]") {
+                    LogMessage -message ("Detected 100% upgrade progress!") -Type 1 -Component 'Upgrade'
+                    return $true
                 }
-                try {
-                    $lines = Get-LastLines -Path $setupactLogPath -LineCount 1000
-                    if ($lines -match "Overall progress: \[100%\]") {
-                        LogMessage -message ("Found 100% progress.") -Type 1 -Component 'Upgrade'
-                        break
-                    }
-                    else {
-                        $iteration++
-                        if ($iteration % 3 -eq 0) {
-                            LogMessage -message ("Still checking... not 100% yet.") -Type 1 -Component 'Upgrade'
-                        }
-                    }
-                }
-                catch {
-                    LogMessage -message ("Error reading file: $_" ) -Type 3 -Component 'Upgrade'
-                }
+                return $false
+            }
 
-                Start-Sleep -Seconds $checkLogIntervalSeconds
-            }         
+            if (-not $result) {
+                LogMessage -message ("Timeout waiting for 100% line in setupact.log") -Type 3 -Component 'Upgrade'
+                try { Stop-Transcript } catch {}
+                exit 1
+            }
+
         }
         catch {
-            LogMessage -message ("Failed to start Windows11InstallationAssistant.exe. Error: $_") -Type 3 -Component 'Upgrade'
+            LogMessage -message ("Upgrade monitoring failed: $_") -Type 3 -Component 'Upgrade'
             try { Stop-Transcript } catch {}
-            throw "Failed to start upgrade process."
-        }    
-        
+            Write-Host "Failed to complete upgrade process."
+            exit 1
+        }
     }
 }
 Stop-Transcript
+Exit 0
 
