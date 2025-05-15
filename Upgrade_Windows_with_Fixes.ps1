@@ -127,6 +127,9 @@ Contact: https://x.com/MEM_MVP
 - Unregister exsisting cleanup task if it exsists.
 - Updated the Get-LastLines function to read locked files.
 
+27 - May 15, 2025
+- Changes to the Get-WinREInfo function to resolve issue causing it to always fail to find the partition info.
+
 .EXAMPLE
 To execute the script manually:
 
@@ -183,7 +186,7 @@ if ("$env:PROCESSOR_ARCHITEW6432" -ne "ARM64") {
 # ------------------------------------
 # Script Version Info
 # ------------------------------------
-[int]$ScriptVersion = 26
+[int]$ScriptVersion = 27
 
 
 # ========================================
@@ -744,52 +747,82 @@ Else {
 
     
     function Get-WinREInfo {
+        <#
+        .SYNOPSIS
+        Retrieves Windows Recovery Environment (WinRE) configuration details.
+    
+        .DESCRIPTION
+        This function checks whether WinRE is enabled, and gathers details about the WinRE partition,
+        such as its disk/partition number, size, and free space. It prefers using the structured
+        ReAgent.xml file for disk and partition info, falling back to parsing reagentc output if needed.
+    
+        .EXAMPLE
+        Get-WinREInfo
+    
+        .NOTES
+        Author: Your Name
+        #>
+    
         LogMessage -message ("Retrieving current WinRE Info") -Type 1 -Component 'Get-WinREInfo'
-
+    
         try {
             $WinreInfo = reagentc /info
             $WinreInfoLines = $WinreInfo -split "`r?`n"
-
+    
             foreach ($line in $WinreInfoLines) {
                 if (-not [string]::IsNullOrWhiteSpace($line)) {
                     LogMessage -message $line
                 }
             }
-            $RecoveryPartitionStatus = $WinreInfo.split("`n")[3].split(' ')[-1]
-
+    
+            $statusLine = $WinreInfoLines | Where-Object { $_ -match "Windows RE status" }
+            $RecoveryPartitionStatus = $statusLine -replace '.*:\s*', ''
+    
             if ($RecoveryPartitionStatus -eq 'Enabled') {
                 LogMessage -message ("Recovery Agent is enabled") -Type 1 -Component 'Get-WinREInfo'
-
-                [xml]$ReAgentXML = Get-Content "$env:SystemRoot\System32\Recovery\ReAgent.xml" -ErrorAction Stop
-
                 $WinREImagepath = "$env:SystemRoot\System32\Recovery\WinRE.wim"
-
                 $OSPartitionObject = Get-Partition -DriveLetter ($env:SystemDrive).Substring(0, 1)
                 $WinREImageLocationDisk = $OSPartitionObject.DiskNumber
                 $WinREImageLocationPartition = $OSPartitionObject.PartitionNumber
-
-                $ReAgentCCurrentDrive = $WinreInfo.split("`n")[4].Substring(31).Trim() -replace '\0', ''
-                $recoveryPathInfo = $ReAgentCCurrentDrive -replace '\\\?\\GLOBALROOT\\device\\', ''
-
-                if ($recoveryPathInfo -match 'harddisk(\\d+).*partition(\\d+)') {
-                    $RecoveryDiskNumber = [int]$matches[1]
-                    $RecoveryPartitionNumber = [int]$matches[2]
+    
+                # Try XML first
+                [xml]$ReAgentXML = Get-Content "$env:SystemRoot\System32\Recovery\ReAgent.xml" -ErrorAction Stop
+                $winreLocation = $ReAgentXML.ReAgentConfig.WinreLocation
+    
+                $RecoveryDiskNumber = $null
+                $RecoveryPartitionNumber = $null
+    
+                if ($winreLocation -and $winreLocation.DiskId -ne $null -and $winreLocation.PartitionId -ne $null) {
+                    $RecoveryDiskNumber = [int]$winreLocation.DiskId
+                    $RecoveryPartitionNumber = [int]$winreLocation.PartitionId
+                    LogMessage -message ("Retrieved disk/partition from ReAgent.xml: Disk $RecoveryDiskNumber, Partition $RecoveryPartitionNumber") -Type 1 -Component 'Get-WinREInfo'
                 }
                 else {
-                    LogMessage -message ("Unable to extract disk and partition number from ReAgentC output.") -Type 2 -Component 'Get-WinREInfo'
-                    return @([PSCustomObject]@{ WinREStatus = "Disabled"; ImagePath = $null })
+                    # Fallback: parse reagentc output
+                    $ReAgentCCurrentDrive = $WinreInfoLines | Where-Object { $_ -match "Recovery image location" } | ForEach-Object { $_ -replace '.*:\s*', '' } | ForEach-Object { $_.Trim() -replace '\0', '' }
+                    $recoveryPathInfo = $ReAgentCCurrentDrive -replace '\\\?\\GLOBALROOT\\device\\', ''
+    
+                    if ($recoveryPathInfo -match '(?i)harddisk(\d+).*partition(\d+)') {
+                        $RecoveryDiskNumber = [int]$matches[1]
+                        $RecoveryPartitionNumber = [int]$matches[2]
+                        LogMessage -message ("Extracted disk/partition from reagentc output: Disk $RecoveryDiskNumber, Partition $RecoveryPartitionNumber") -Type 1 -Component 'Get-WinREInfo'
+                    }
+                    else {
+                        LogMessage -message ("Unable to extract disk and partition number from either XML or reagentc output.") -Type 2 -Component 'Get-WinREInfo'
+                        return @([PSCustomObject]@{ WinREStatus = "Disabled"; ImagePath = $null })
+                    }
                 }
-
+    
                 $RecoveryPartition = Get-Partition -DiskNumber $RecoveryDiskNumber -PartitionNumber $RecoveryPartitionNumber -ErrorAction SilentlyContinue
                 if (-not $RecoveryPartition) {
                     LogMessage -message ("Recovery partition not found.") -Type 2 -Component 'Get-WinREInfo'
                     return @([PSCustomObject]@{ WinREStatus = "Disabled"; ImagePath = $null })
                 }
-
+    
                 $diskInfo = Get-Disk -Number $RecoveryDiskNumber
                 $PartitionStyle = $diskInfo.PartitionStyle
                 $LastPartitionNumber = (Get-Partition -DiskNumber $RecoveryDiskNumber | Sort-Object Offset | Select-Object -Last 1).PartitionNumber
-
+    
                 try {
                     $SupportedSize = Get-PartitionSupportedSize -DiskNumber $RecoveryDiskNumber -PartitionNumber $RecoveryPartitionNumber
                     $RecoveryPartitionSize = [math]::Round($RecoveryPartition.Size / 1MB, 2)
@@ -802,32 +835,32 @@ Else {
                     $RecoveryPartitionFreeMB = 0
                     $RecoveryPartitionFreeGB = 0
                 }
-
+    
                 $OSIsLast = ($OSPartitionObject.PartitionNumber -eq $LastPartitionNumber)
                 $RecoveryIsLastPartition = ($RecoveryPartitionNumber -eq $LastPartitionNumber)
-
+    
                 LogMessage -message ("Recovery partition size: $($RecoveryPartitionSize) MB") -Type 1 -Component 'Get-WinREInfo'
                 LogMessage -message ("Recovery partition free space: $($RecoveryPartitionFreeMB) MB") -Type 1 -Component 'Get-WinREInfo'
                 LogMessage -message ("Recovery is last partition? $($RecoveryIsLastPartition)") -Type 1 -Component 'Get-WinREInfo'
                 LogMessage -message ("OS is last partition? $($OSIsLast)") -Type 1 -Component 'Get-WinREInfo'
                 LogMessage -message ("Partition Style: $($PartitionStyle)") -Type 1 -Component 'Get-WinREInfo'
-
+    
                 return @([PSCustomObject]@{
-                        WinREStatus          = "Enabled"
-                        ImagePath            = $WinREImagepath
-                        DiskNumber           = $WinREImageLocationDisk
-                        WinREImageLocation   = $WinREImageLocationPartition
-                        PartitionStyle       = $PartitionStyle
-                        LastPartition        = $LastPartitionNumber
-                        OSIsLast             = $OSIsLast
-                        winREPartitionSizeMB = $RecoveryPartitionSize
-                        winREPartitionFree   = $RecoveryPartitionFreeGB
-                        winREPartitionFreeMB = $RecoveryPartitionFreeMB
-                        winREIsLast          = $RecoveryIsLastPartition
-                        DiskIndex            = $WinREImageLocationDisk
-                        OSPartition          = $OSPartitionObject.PartitionNumber
-                        winREPartitionNumber = $RecoveryPartitionNumber
-                    })
+                    WinREStatus          = "Enabled"
+                    ImagePath            = $WinREImagepath
+                    DiskNumber           = $WinREImageLocationDisk
+                    WinREImageLocation   = $WinREImageLocationPartition
+                    PartitionStyle       = $PartitionStyle
+                    LastPartition        = $LastPartitionNumber
+                    OSIsLast             = $OSIsLast
+                    winREPartitionSizeMB = $RecoveryPartitionSize
+                    winREPartitionFree   = $RecoveryPartitionFreeGB
+                    winREPartitionFreeMB = $RecoveryPartitionFreeMB
+                    winREIsLast          = $RecoveryIsLastPartition
+                    DiskIndex            = $WinREImageLocationDisk
+                    OSPartition          = $OSPartitionObject.PartitionNumber
+                    winREPartitionNumber = $RecoveryPartitionNumber
+                })
             }
             else {
                 LogMessage -message ("Recovery Agent is NOT enabled.") -Type 2 -Component 'Get-WinREInfo'
@@ -838,7 +871,7 @@ Else {
             LogMessage -message ("Failed to retrieve WinRE information: $($_.Exception.Message)") -Type 3 -Component 'Get-WinREInfo'
             return @([PSCustomObject]@{ WinREStatus = "Error"; ImagePath = $null })
         }
-    }
+    }    
 
   
     function Disable-WinRE {
