@@ -130,6 +130,12 @@ Contact: https://x.com/MEM_MVP
 27 - May 15, 2025
 - Changes to the Get-WinREInfo function to resolve issue causing it to always fail to find the partition info.
 
+28 - May 16, 2025
+- Assume failure on timeout and remove the scheduled task
+
+29 - May 16, 2025
+- Edit the scheduled task so that disk clean only runs if the OS is Windows 11
+
 .EXAMPLE
 To execute the script manually:
 
@@ -186,7 +192,7 @@ if ("$env:PROCESSOR_ARCHITEW6432" -ne "ARM64") {
 # ------------------------------------
 # Script Version Info
 # ------------------------------------
-[int]$ScriptVersion = 27
+[int]$ScriptVersion = 29
 
 
 # ========================================
@@ -846,21 +852,21 @@ Else {
                 LogMessage -message ("Partition Style: $($PartitionStyle)") -Type 1 -Component 'Get-WinREInfo'
     
                 return @([PSCustomObject]@{
-                    WinREStatus          = "Enabled"
-                    ImagePath            = $WinREImagepath
-                    DiskNumber           = $WinREImageLocationDisk
-                    WinREImageLocation   = $WinREImageLocationPartition
-                    PartitionStyle       = $PartitionStyle
-                    LastPartition        = $LastPartitionNumber
-                    OSIsLast             = $OSIsLast
-                    winREPartitionSizeMB = $RecoveryPartitionSize
-                    winREPartitionFree   = $RecoveryPartitionFreeGB
-                    winREPartitionFreeMB = $RecoveryPartitionFreeMB
-                    winREIsLast          = $RecoveryIsLastPartition
-                    DiskIndex            = $WinREImageLocationDisk
-                    OSPartition          = $OSPartitionObject.PartitionNumber
-                    winREPartitionNumber = $RecoveryPartitionNumber
-                })
+                        WinREStatus          = "Enabled"
+                        ImagePath            = $WinREImagepath
+                        DiskNumber           = $WinREImageLocationDisk
+                        WinREImageLocation   = $WinREImageLocationPartition
+                        PartitionStyle       = $PartitionStyle
+                        LastPartition        = $LastPartitionNumber
+                        OSIsLast             = $OSIsLast
+                        winREPartitionSizeMB = $RecoveryPartitionSize
+                        winREPartitionFree   = $RecoveryPartitionFreeGB
+                        winREPartitionFreeMB = $RecoveryPartitionFreeMB
+                        winREIsLast          = $RecoveryIsLastPartition
+                        DiskIndex            = $WinREImageLocationDisk
+                        OSPartition          = $OSPartitionObject.PartitionNumber
+                        winREPartitionNumber = $RecoveryPartitionNumber
+                    })
             }
             else {
                 LogMessage -message ("Recovery Agent is NOT enabled.") -Type 2 -Component 'Get-WinREInfo'
@@ -2098,11 +2104,14 @@ public class FileAccessHelper {
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
         }
 
-        # Build the actual script content separately (easy to indent and maintain)
+        # Build the actual script content separately (easy to maintain)
         $taskScript = @"
+if ((Get-WmiObject Win32_OperatingSystem).Caption -Match "Windows 11"){
 Start-Process CleanMgr.exe -ArgumentList '/sagerun:1234' -WindowStyle Hidden -Wait
+}
 Unregister-ScheduledTask -TaskName '$taskName' -Confirm:\$false
 "@
+
 
         # Write it to disk
         Set-Content -Path $scriptPath -Value $taskScript -Encoding UTF8
@@ -2169,6 +2178,16 @@ Unregister-ScheduledTask -TaskName '$taskName' -Confirm:\$false
 
             if (-not $result) {
                 LogMessage -message ("Timeout waiting for 100% line in setupact.log") -Type 3 -Component 'Upgrade'
+                LogMessage -message ("Assume failure.") -Type 2 -Component 'Upgrade'
+                
+                
+                LogMessage -message ("Removing the scheduled task to preserve logs.") -Type 1 -Component 'Upgrade'
+                # Check for, and remove, exsisting scheduled task
+                $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                if ($task) {
+                    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+                }
+                
                 try { Stop-Transcript } catch {}
                 exit 1
             }
