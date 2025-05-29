@@ -136,6 +136,10 @@ Contact: https://x.com/MEM_MVP
 29 - May 16, 2025
 - Edit the scheduled task so that disk clean only runs if the OS is Windows 11
 
+30 - May 29, 2025
+- Simplified the "Clean-Drivers" function to make it unconditionally remove Microsoft XPS Document Writer and Microsoft Print to PDF
+    printer drivers and reinstall them via Windows capabilities.
+
 .EXAMPLE
 To execute the script manually:
 
@@ -192,7 +196,7 @@ if ("$env:PROCESSOR_ARCHITEW6432" -ne "ARM64") {
 # ------------------------------------
 # Script Version Info
 # ------------------------------------
-[int]$ScriptVersion = 29
+[int]$ScriptVersion = 30
 
 
 # ========================================
@@ -200,7 +204,6 @@ if ("$env:PROCESSOR_ARCHITEW6432" -ne "ARM64") {
 # ========================================
 $Now = Get-Date -Format MM-dd-yyyy-HH-mm-ss
 $LogFile = "C:\Windows\Logs\Win11_Upgrade-$Now.log"
-$DriverLog = "C:\Windows\Logs\UnsignedPrinterDrivers.csv"
 $TranscriptFile = "C:\Windows\Logs\Win11_Upgrade_Transcript-$Now.log"
 Start-Transcript -Path $TranscriptFile
 Write-Host "Starting upgrade using script version: $($ScriptVersion)"
@@ -338,84 +341,69 @@ Else {
     
     function Clean-Drivers {
         <#
-        .SYNOPSIS
-        Detects and removes unsigned Microsoft printer drivers that may block Windows 11 upgrades.
+    .SYNOPSIS
+    Removes Microsoft virtual printer drivers that can block Windows 11 upgrades.
 
-        .DESCRIPTION
-        This function scans all installed printer drivers, identifies those published by Microsoft that are unsigned, 
-        and removes them along with any associated printers. It then reinstalls built-in Microsoft virtual printers 
-        (such as Microsoft Print to PDF and XPS Document Writer) if they were removed. 
+    .DESCRIPTION
+    Unconditionally removes Microsoft XPS Document Writer and Microsoft Print to PDF
+    printer drivers and reinstalls them via Windows capabilities.
+    #>
 
-        Unsigned drivers are logged to a CSV file for reference.
-
-        .OUTPUTS
-        None. Writes log entries and exports a CSV of unsigned drivers to $driverLog.
-
-        .NOTES
-        This remediation targets known upgrade blocks related to legacy unsigned Microsoft print drivers 
-        (e.g., Type 3 kernel-mode drivers).
-        #>
-        Write-Host "Scanning installed printer drivers..."
-        $unsignedDrivers = @()
         $removedDrivers = @()
-        Get-PrinterDriver | ForEach-Object {
-            $driver = $_
-            $driverName = $driver.Name
+        $targets = @(
+            "Microsoft XPS Document Writer",
+            "Microsoft Print To PDF"
+        )
 
-            # Get detailed info from Win32_PrinterDriver
-            $wmiDriver = Get-WmiObject -Query "SELECT * FROM Win32_PrinterDriver WHERE Name = '$driverName'" -ErrorAction SilentlyContinue
+        foreach ($targetDriver in $targets) {
+            # Remove any printers using this driver
+            $printersUsingDriver = Get-Printer | Where-Object { $_.DriverName -like "$targetDriver*" }
 
-            if ($wmiDriver -and $wmiDriver.DriverPath -and (Test-Path $wmiDriver.DriverPath)) {
-                $sig = Get-AuthenticodeSignature -FilePath $wmiDriver.DriverPath
-
-                if ($sig.Status -ne 'Valid' -and $driver.Publisher -like '*Microsoft*') {
-                    LogMessage -message ("Unsigned Microsoft driver found: $driverName")
-                    $unsignedDrivers += [PSCustomObject]@{
-                        DriverName      = $driverName
-                        DriverPath      = $wmiDriver.DriverPath
-                        SignatureStatus = $sig.Status
-                        Publisher       = $driver.Publisher
-                    }
+            foreach ($printer in $printersUsingDriver) {
+                LogMessage -message (" -> Removing printer: $($printer.Name) (Driver: $($printer.DriverName))") -Type 1 -Component 'Clean-Drivers'
+                try {
+                    Remove-Printer -Name $printer.Name -ErrorAction Stop
+                    LogMessage -message ("    Successfully removed printer: $($printer.Name)") -Type 1 -Component 'Clean-Drivers'
+                }
+                catch {
+                    LogMessage -message ("    Failed to remove printer: $($printer.Name) — $_") -Type 2 -Component 'Clean-Drivers'
                 }
             }
-        }
 
-        # Log results
-        if ($unsignedDrivers.Count -gt 0) {
-            $unsignedDrivers | Export-Csv -Path $driverLog -NoTypeInformation
-            LogMessage -message ("Logged unsigned drivers to $driverLog") -Type 1 -Component 'Clean-Drivers'
+            # Remove the printer driver
+            $driver = Get-PrinterDriver | Where-Object { $_.Name -like "$targetDriver*" }
 
-            # Remove associated printers first
-            LogMessage -message ("Removing printers using unsigned drivers...") -Type 1 -Component 'Clean-Drivers'
-            Get-Printer | Where-Object { $_.DriverName -in $unsignedDrivers.DriverName } | ForEach-Object {
-                LogMessage -message (" - > Removing printer: $($_.Name)") -Type 1 -Component 'Clean-Drivers'
-                Remove-Printer -Name $_.Name -ErrorAction SilentlyContinue
+            if ($driver) {
+                LogMessage -message ("Removing driver: $($driver.Name)") -Type 1 -Component 'Clean-Drivers'
+                try {
+                    Remove-PrinterDriver -Name $driver.Name -ErrorAction Stop
+                    LogMessage -message ("    Successfully removed driver: $($driver.Name)") -Type 1 -Component 'Clean-Drivers'
+                    $removedDrivers += $driver.Name
+                }
+                catch {
+                    LogMessage -message ("Failed to remove driver: $($driver.Name)") -Type 2 -Component 'Clean-Drivers'
+                }
             }
-
-            # Remove the unsigned drivers
-            LogMessage -message ("Removing unsigned Microsoft printer drivers...") -Type 1 -Component 'Clean-Drivers'
-            foreach ($driver in $unsignedDrivers) {
-                LogMessage -message ("  -> Removing driver: $($driver.DriverName)") -Type 1 -Component 'Clean-Drivers'
-                Remove-PrinterDriver -Name $driver.DriverName -ErrorAction SilentlyContinue
-                $removedDrivers += $driver.DriverName
-            }
-
-            # Conditionally reinstall Microsoft virtual printers if removed
-            if ($removedDrivers -match "Microsoft Print to PDF") {
-                LogMessage -message ("Reinstalling Microsoft Print to PDF...") -Type 1 -Component 'Clean-Drivers'
-                Add-WindowsCapability -Online -Name "Printing.PrintToPDF~~~~0.0.1.0" -ErrorAction SilentlyContinue
-            }
-
-            if ($removedDrivers -match "Microsoft XPS Document Writer") {
-                LogMessage -message ("Reinstalling Microsoft XPS Document Writer...") -Type 1 -Component 'Clean-Drivers'
-                Add-WindowsCapability -Online -Name "Printing.XPSServices~~~~0.0.1.0" -ErrorAction SilentlyContinue
+            else {
+                LogMessage -message ("Driver not found: $targetDriver") -Type 1 -Component 'Clean-Drivers'
             }
         }
-        else {
-            LogMessage -message ("No unsigned Microsoft printer drivers found.") -Type 1 -Component 'Clean-Drivers'
+
+        # Reinstall if any were removed
+        if ($removedDrivers -match "Microsoft Print to PDF") {
+            LogMessage -message ("Reinstalling Microsoft Print to PDF...") -Type 1 -Component 'Clean-Drivers'
+            Add-WindowsCapability -Online -Name "Printing.PrintToPDF~~~~0.0.1.0" -ErrorAction SilentlyContinue
+        }
+
+        if ($removedDrivers -match "Microsoft XPS Document Writer") {
+            LogMessage -message ("Reinstalling Microsoft XPS Document Writer...") -Type 1 -Component 'Clean-Drivers'
+            Add-WindowsCapability -Online -Name "Printing.XPSServices~~~~0.0.1.0" -ErrorAction SilentlyContinue
+        }
+
+        if (-not $removedDrivers) {
+            LogMessage -message ("No matching printer drivers found for removal.") -Type 1 -Component 'Clean-Drivers'
         }
     }
-
     function ExtractNumbers([string]$str) {
         <#
         .SYNOPSIS
