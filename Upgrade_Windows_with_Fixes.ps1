@@ -140,6 +140,10 @@ Contact: https://x.com/MEM_MVP
 - Simplified the "Clean-Drivers" function to make it unconditionally remove Microsoft XPS Document Writer and Microsoft Print to PDF
     printer drivers and reinstall them via Windows capabilities.
 
+31 - May 30, 2025
+- Add the ability to kill the restart prompt after the upgrade completes. This allows us to use Intune to reboot the computer which is more flexible than the hardcoded 30 min prompt.
+- $allowRestart = $true by default. Change to $false to kill the prompt. 
+
 .EXAMPLE
 To execute the script manually:
 
@@ -196,7 +200,7 @@ if ("$env:PROCESSOR_ARCHITEW6432" -ne "ARM64") {
 # ------------------------------------
 # Script Version Info
 # ------------------------------------
-[int]$ScriptVersion = 30
+[int]$ScriptVersion = 31
 
 
 # ========================================
@@ -213,6 +217,7 @@ Write-Host "Starting upgrade using script version: $($ScriptVersion)"
 # Variables: Script Configuration
 # ========================================
 $upgradeArgs = "/quietinstall /skipeula /auto upgrade /copylogs $Win11WorkingDirectory"
+$allowRestart = $true # Change to $false to prevent the reboot.
 
 
 # ========================================
@@ -2159,6 +2164,99 @@ Unregister-ScheduledTask -TaskName '$taskName' -Confirm:\$false
                 param($line)
                 if ($line -match "Overall progress: \[100%\]") {
                     LogMessage -message ("Detected 100% upgrade progress!") -Type 1 -Component 'Upgrade'
+
+                    # Kill the restart prompt if variable set to false.
+                    if (-not $allowRestart) {
+                        LogMessage -message ("Reboot is not allowed. Monitoring for reboot prompt...") -Type 2 -Component 'Upgrade'
+
+                        # Add WindowEnumerator class only if not already defined
+                        if (-not ([System.Management.Automation.PSTypeName]'WindowEnumerator').Type) {
+                            Add-Type @"
+            using System;
+            using System.Text;
+            using System.Collections.Generic;
+            using System.Runtime.InteropServices;
+
+            public class WindowEnumerator {
+                public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+                [DllImport("user32.dll")]
+                [return: MarshalAs(UnmanagedType.Bool)]
+                public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+                [DllImport("user32.dll", SetLastError = true)]
+                public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+                [DllImport("user32.dll", SetLastError = true)]
+                public static extern int GetWindowTextLength(IntPtr hWnd);
+
+                [DllImport("user32.dll")]
+                public static extern bool IsWindowVisible(IntPtr hWnd);
+
+                public static List<string> GetOpenWindows() {
+                    List<string> titles = new List<string>();
+
+                    EnumWindows(delegate (IntPtr hWnd, IntPtr lParam) {
+                        if (IsWindowVisible(hWnd)) {
+                            int length = GetWindowTextLength(hWnd);
+                            if (length > 0) {
+                                StringBuilder builder = new StringBuilder(length + 1);
+                                GetWindowText(hWnd, builder, builder.Capacity);
+                                titles.Add(builder.ToString());
+                            }
+                        }
+                        return true;
+                    }, IntPtr.Zero);
+
+                    return titles;
+                }
+            }
+"@
+                        }
+
+                        # Monitor for the reboot prompt for up to 60 minutes
+                        $checkIntervalSeconds = 2
+                        $timeoutMinutes = 10
+                        $elapsedSeconds = 0
+                        $timeoutSeconds = $timeoutMinutes * 60
+                        $windowFound = $false
+
+                        while ($elapsedSeconds -lt $timeoutSeconds) {
+                            $allWindows = [WindowEnumerator]::GetOpenWindows()
+                            $matchedTitle = $allWindows | Where-Object { $_ -like "*Installation Assistant*" }
+
+                            if ($matchedTitle) {
+                                LogMessage -message ("Detected reboot prompt window: '$matchedTitle'. Attempting to terminate Windows10UpgraderApp.exe...") -Type 2 -Component 'Upgrade'
+
+                                $proc = Get-Process -Name "Windows10UpgraderApp" -ErrorAction SilentlyContinue
+                                if ($proc) {
+                                    $proc | Stop-Process -Force
+                                    LogMessage -message ("Successfully terminated Windows10UpgraderApp.exe. Reboot should be aborted.") -Type 1 -Component 'Upgrade'
+
+                                    # Stop logging and exit with reboot exit code so Intune prompts for reboot.
+                                    LogMessage -message ("Returning exit code 3010 to signal Intune that a reboot is required.") -Type 1 -Component 'Upgrade'
+
+                                    try { Stop-Transcript } catch {}
+                                    Exit 3010
+
+                                }
+                                else {
+                                    LogMessage -message ("Windows10UpgraderApp.exe not found. It may have already exited.") -Type 2 -Component 'Upgrade'
+                                }
+
+                                $windowFound = $true
+                                break
+                            }
+
+                            Start-Sleep -Seconds $checkIntervalSeconds
+                            $elapsedSeconds += $checkIntervalSeconds
+                        }
+
+                        if (-not $windowFound) {
+                            LogMessage -message ("Timed out after $timeoutMinutes minutes without detecting reboot prompt.") -Type 3 -Component 'Upgrade'
+                        }
+                    }
+
                     return $true
                 }
                 return $false
@@ -2191,4 +2289,3 @@ Unregister-ScheduledTask -TaskName '$taskName' -Confirm:\$false
 }
 Stop-Transcript
 Exit 0
-
